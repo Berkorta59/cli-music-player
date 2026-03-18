@@ -8,7 +8,7 @@ use ratatui::widgets::Gauge;
 use rodio::{Decoder, OutputStream, Sink} ; // ses oynatma için kullanılan bir kütüphane
 use walkdir::WalkDir; // dosya sisteminde gezinmek için kullanılan bir kütüphane
 use std::io::stdout; // standart çıktı için kullanılan modül
-
+use ratatui::widgets::Paragraph;
 
 use crossterm::{ // terminal kontrolü için kullanılan bir kütüphane
     event::{self, Event, KeyCode}, // terminaldeki olayları dinlemek için kullanılan modül
@@ -32,6 +32,7 @@ struct App {    // uygulama sınıfı
     is_playing: bool,
     paused_elapsed: Duration,
     volume: f32, // ses seviyesini tutan bir değişken
+    album_art: Option<Vec<u8>>, // albüm kapağı verisini tutan bir değişken
 }
 
 fn load_songs(folder: &str) -> Vec<String>{ // belirtilen klasördeki mp3 dosyalarını yükleyen bir fonksiyon
@@ -64,6 +65,37 @@ fn format_duration(d: Duration) -> String {
     format!("{:02}:{:02}", mins, secs)
 }
 
+fn get_album_art(path: &str) -> Option<Vec<u8>>{
+    use id3::{Tag, TagLike};
+    let tag = Tag::read_from_path(path).ok()?;
+    tag.pictures().next().map(|p| p.data.clone())
+}
+
+fn render_album_art(data: &[u8], width: u16, height: u16) -> ratatui::text::Text<'static>{
+    use image::{GenericImageView, imageops::FilterType};
+    let Ok(img) = image::load_from_memory(data) else{
+        return ratatui::text::Text::raw("No image");
+    };
+    let img = img.resize_exact(width as u32, height as u32 * 2, FilterType::Triangle);
+
+    let mut lines = Vec::new();
+    for y in (0..img.height()).step_by(2){
+        let mut spans = Vec::new();
+        for x in 0..img.width(){
+            let top = img.get_pixel(x, y);
+            let bot = if y + 1 < img.height() { img.get_pixel(x, y + 1)} else { top };
+            spans.push(ratatui::text::Span::styled(
+                "▄",
+                Style::default()
+                    .fg(Color::Rgb(bot[0], bot[1], bot[2]))
+                    .bg(Color::Rgb(top[0], top[1], top[2])),
+            ));
+        }
+        lines.push(ratatui::text::Line::from(spans));
+    }
+    ratatui::text::Text::from(lines)
+}
+
 fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulamanın giriş noktası
     let songs = load_songs("./music"); // music klasöründe bulunan mp3 dosyalarını yükle
     
@@ -81,6 +113,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
         is_playing: false,
         paused_elapsed: Duration::ZERO,
         volume: 1.0, // başlangıçta ses seviyesini 1.0 (maksimum) olarak ayarlamak için kullanılan bir kod
+        album_art: None, // başlangıçta albüm kapağı verisini None olarak ayarlamak için kullanılan bir kod
     };
 
     app.state.select(Some(0)); // başlangıçta ilk şarkıyı seçili olarak göstermek için kullanılan bir kod
@@ -122,14 +155,20 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
         
         terminal.draw(|f| { // terminal arayüzü güncellemek için kullanılan bir kod
 
-            let chunks = Layout::default() // terminal düzenini tanımlamak için kullanılan bir kod
-                .direction(Direction::Vertical) // dikey olarak oluşturmak için kullanılan bir kod
-                .constraints([
-                    Constraint::Min(3), 
-                    Constraint::Length(3),
-                    Constraint::Length(3), 
-                ]) 
-                .split(f.size()); // terminal alanını bölmek için kullanılan bir kod
+            let main_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(14)])
+                .split(f.size());
+
+            let bottom_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(28), Constraint::Min(0)])
+                .split(main_chunks[1]);
+            
+            let control_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(3), Constraint::Length(3)])
+                .split(bottom_chunks[1]);
             
             let items: Vec<ListItem> = app // şarkıların dosya yollarını list item'lara dönüştürmek için kullanılan bir kod
                 .songs // şarkıların dosya yollarını içeren vektör
@@ -143,6 +182,18 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                 })
                 .collect(); // dosya yollarını bir vektörde toplamak için kullanılan bir kod
 
+            let art_block = Block::default().title(" Album ").borders(Borders::ALL);
+            if let Some(art_data) = &app.album_art {
+                let inner = art_block.inner(bottom_chunks[0]);
+                let art_text = render_album_art(art_data, inner.width, inner.height);
+                let art_widget = Paragraph::new(art_text).block(art_block);
+                f.render_widget(art_widget, bottom_chunks[0]);
+            } else {
+                let placeholder = Paragraph::new("\n\n     ♪")
+                    .block(art_block);
+                f.render_widget (placeholder, bottom_chunks[0]);
+            }
+
             let list = List::new(items) // list widget'ını oluşturmak için kullanılan bir kod
                 .block(Block::default().title("MP3 Player  [↑↓] Seç  [Enter] Oynat  [Space] Duraklat  [q] Çık [+/-] Ses").borders(Borders::ALL)) // list widget'ının başlığını ve kenarlıklarını ayarlamak için kullanılan bir kod
                 .highlight_style( // seçili şarkının stilini ayarlamak için kullanılan bir kod
@@ -152,8 +203,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                         .add_modifier(Modifier::BOLD) // metni kalın yapmak için kullanılan bir kod
                 )
                 .highlight_symbol(">> "); // seçili şarkının başına ">> " sembolü eklemek için kullanılan bir kod
-
-            f.render_stateful_widget(list, chunks[0], &mut app.state); 
+            f.render_stateful_widget(list, main_chunks[0], &mut app.state); // list widget'ını terminalde göstermek için kullanılan bir kod
 
             let gauge = Gauge::default()
                 .block(
@@ -167,14 +217,13 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                         .bg(Color::DarkGray),
                 )
                 .ratio(ratio);
-            
-            f.render_widget(gauge, chunks[1]);
+            f.render_widget(gauge, control_chunks[1]);
 
             let vol_gauge = Gauge::default()
                 .block(Block::default().title(format!(" Ses: {:.0}% ", app.volume * 100.0)).borders(Borders::ALL))
                 .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
                 .ratio((app.volume / 2.0) as f64);
-            f.render_widget(vol_gauge, chunks[2]);
+            f.render_widget(vol_gauge, control_chunks[2]);
 
         })?; // terminal arayüzünü güncellemek için kullanılan bir kod
 
@@ -202,10 +251,13 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                         sink.stop(); // mevcut şarkıyı durdurmak için kullanılan bir kod
                         play_song(&app.songs[app.selected], &sink); // seçili şarkıyı oynatmak için kullanılan bir kod
 
+                        app.album_art = get_album_art(&app.songs[app.selected]);
+
                         app.song_duration = get_mp3_duration(&app.songs[app.selected]);
                         app.play_start = Some(Instant::now());
                         app.paused_elapsed = Duration::ZERO;
                         app.is_playing = true;
+                        
                     }
 
                     KeyCode::Char(' ') => { // boşluk tuşuna basıldığında şarkıyı duraklatmak veya devam ettirmek için kullanılan bir kod
