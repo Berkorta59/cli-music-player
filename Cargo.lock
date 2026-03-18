@@ -175,6 +175,7 @@ name = "cli-music-player"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "mp3-duration",
  "ratatui",
  "rodio",
  "walkdir",
@@ -561,6 +562,15 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "mp3-duration"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "348bdc7300502f0801e5b57c448815713cd843b744ef9bda252a2698fdf90a0f"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

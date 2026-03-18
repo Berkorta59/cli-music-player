@@ -1,6 +1,12 @@
 use std::fs::File; // standart dosya sistemi modülünden file sınıfı import edildi
 use std::io::BufReader; // dosyaları daha verimli okumak için kullanılan bir sınıf
 use std::time::Duration; // süre ölçümü için kullanılan bir sınıf
+use ratatui::widgets::ListState; // terminal arayüzünde liste widget'ının durumunu tutmak için kullanılan bir sınıf
+use ratatui::style::{Style, Color, Modifier}; // terminal arayüzünde stil ve renkler için kullanılan modül
+use std::time::Instant;
+use ratatui::widgets::Gauge;
+
+
 
 use crossterm::{ // terminal kontrolü için kullanılan bir kütüphane
     event::{self, Event, KeyCode}, // terminaldeki olayları dinlemek için kullanılan modül
@@ -24,6 +30,11 @@ use std::io::stdout; // standart çıktı için kullanılan modül
 struct App {    // uygulama sınıfı
     songs: Vec<String>, // şarkıların dosya yollarını tutan bir vektör
     selected: usize,  // seçili şarkının indeksini tutan bir değişken
+    state: ListState, // terminal arayüzünde liste widget'ının durumunu tutan bir değişken
+    play_start: Option<Instant>,
+    song_duration: Option<Duration>,
+    is_playing: bool,
+    paused_elapsed: Duration,
 }
 
 fn load_songs(folder: &str) -> Vec<String>{ // belirtilen klasördeki mp3 dosyalarını yükleyen bir fonksiyon
@@ -38,12 +49,22 @@ fn load_songs(folder: &str) -> Vec<String>{ // belirtilen klasördeki mp3 dosyal
     }
     songs // şarkıların dosya yollarını içeren vektör döndürülür
 }
+fn get_mp3_duration(path: &str) -> Option<Duration> {
+    mp3_duration::from_path(path).ok()
+}
 
 fn play_song (path: &str, sink: &Sink) { // belirtilen şarkıyı oynatan bir fonksiyon
     let file = BufReader::new(File::open(path).unwrap()); // şarkı dosyasını açmak için kullanılan bir kod
     let source = Decoder::new(file).unwrap(); // şarkı dosyasını decode etmek için kullanılan bir kod
     
     sink.append(source); // şarkıyı oynatmak için kullanılan bir kod
+}
+
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{:02}:{:02}", mins, secs)
 }
 
 fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulamanın giriş noktası
@@ -57,7 +78,14 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
     let mut app = App { // uygulama sınıfının bir örneği oluşturulur
         songs, // şarkıların dosya yollarını içeren vektör
         selected: 0, // başlangıçta seçili şarkının indeksini 0 olarak ayarlamak için kullanılan bir kod
+        state: ListState::default(), // liste widget'ının durumunu varsayılan olarak ayarlamak için kullanılan bir kod
+        play_start: None,
+        song_duration: None,
+        is_playing: false,
+        paused_elapsed: Duration::ZERO,
     };
+
+    app.state.select(Some(0)); // başlangıçta ilk şarkıyı seçili olarak göstermek için kullanılan bir kod
 
     let (_stream, stream_handle) = OutputStream::try_default()?; // ses çıkışını başlatmak için kullanılan bir kod
     let sink = Sink::try_new(&stream_handle)?; // ses çıkışını kontrol etmek için kullanılan bir kod
@@ -69,23 +97,79 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
     let mut terminal = Terminal::new(backend)?; // terminali oluşturmak için kullanılan bir kod
 
     loop { // ana döngü, kullanıcı etkileşimlerini dinlemek ve terminal arayüzünü güncellemek için kullanılır
+        let elapsed = if app.is_playing {
+            if let Some(start) = app.play_start {
+                app.paused_elapsed + start.elapsed()
+            } else {
+                Duration::ZERO
+            }
+        } else{
+            app.paused_elapsed
+        };
+
+        let total = app.song_duration.unwrap_or(Duration::ZERO);
+        let ratio = if total.as_secs() > 0 {
+            (elapsed.as_secs_f64() / total.as_secs_f64()).min(1.0)
+        } else {
+            0.0
+        };
+
+        let time_label = if total.as_secs() > 0 {
+            format! (" {} / {} ", format_duration(elapsed), format_duration(total))
+        } else {
+            " --:-- / --:-- ".to_string()
+        };
+        
+        
+        
         terminal.draw(|f| { // terminal arayüzü güncellemek için kullanılan bir kod
 
             let chunks = Layout::default() // terminal düzenini tanımlamak için kullanılan bir kod
                 .direction(Direction::Vertical) // dikey olarak oluşturmak için kullanılan bir kod
-                .constraints([Constraint::Percentage(100)]) // terminal boyutunu ayarlamak için kullanılan bir kod
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(3),
+                ]) 
                 .split(f.size()); // terminal alanını bölmek için kullanılan bir kod
             
             let items: Vec<ListItem> = app // şarkıların dosya yollarını list item'lara dönüştürmek için kullanılan bir kod
                 .songs // şarkıların dosya yollarını içeren vektör
                 .iter() // şarkıların dosya yollarını iterasyon yapmak için kullanılan bir kod
-                .map(|s| ListItem::new(s.clone())) // her bir şarkı dosya yolunu ListItem'a dönüştürmek için kullanılan bir kod
+                .map(|s|{
+                    let name = std::path::Path::new(s)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| s.clone());
+                    ListItem::new(name)
+                })
                 .collect(); // dosya yollarını bir vektörde toplamak için kullanılan bir kod
 
             let list = List::new(items) // list widget'ını oluşturmak için kullanılan bir kod
-                .block(Block::default().title("MP3 Player").borders(Borders::ALL)); // list widget'ının başlığını ve kenarlıklarını ayarlamak için kullanılan bir kod
+                .block(Block::default().title("MP3 Player  [↑↓] Seç  [Enter] Oynat  [Space] Duraklat  [q] Çık ").borders(Borders::ALL)) // list widget'ının başlığını ve kenarlıklarını ayarlamak için kullanılan bir kod
+                .highlight_style( // seçili şarkının stilini ayarlamak için kullanılan bir kod
+                    Style::default() // varsayılan stil
+                        .bg(Color::Blue) // arka plan rengini mavi yapmak için kullanılan bir kod
+                        .fg(Color::White) // metin rengini beyaz yapmak için kullanılan bir kod
+                        .add_modifier(Modifier::BOLD) // metni kalın yapmak için kullanılan bir kod
+                )
+                .highlight_symbol(">> "); // seçili şarkının başına ">> " sembolü eklemek için kullanılan bir kod
 
-            f.render_widget(list, chunks[0]); // list widget'ını terminaldeki belirli bir alana render etmek için kullanılan bir kod
+            f.render_stateful_widget(list, chunks[0], &mut app.state); 
+
+            let gauge = Gauge::default()
+                .block(
+                    Block::default()
+                        .title(time_label)
+                        .borders(Borders::ALL),
+                )
+                .gauge_style(
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::DarkGray),
+                )
+                .ratio(ratio);
+            
+            f.render_widget(gauge, chunks[1]);
         })?; // terminal arayüzünü güncellemek için kullanılan bir kod
 
         if event::poll(Duration::from_millis(200))? { // kullanıcı etkileşimlerini dinlemek için kullanılan bir kod
@@ -97,24 +181,40 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                     KeyCode::Down => { // aşağı ok tuşuna basıldığında seçili şarkıyı değiştirmek için kullanılan bir kod
                         if app.selected + 1 < app.songs.len(){ // seçili şarkının indeksini artırmak için kullanılan bir kod
                             app.selected += 1; 
+                            app.state.select(Some(app.selected));
                         }
                     }
 
                     KeyCode::Up => { // yukarı ok tuşuna basıldığında seçili şarkıyı değiştirmek için kullanılan bir kod
                         if app.selected > 0 { // seçili şarkının indeksini azaltmak için kullanılan bir kod
                             app.selected -= 1; 
+                            app.state.select(Some(app.selected));
                         }
                     }
 
                     KeyCode::Enter => { // enter tuşuna basıldığında seçili şarkıyı oynatmak için kullanılan bir kod
                         sink.stop(); // mevcut şarkıyı durdurmak için kullanılan bir kod
                         play_song(&app.songs[app.selected], &sink); // seçili şarkıyı oynatmak için kullanılan bir kod
+
+                        app.song_duration = get_mp3_duration(&app.songs[app.selected]);
+                        app.play_start = Some(Instant::now());
+                        app.paused_elapsed = Duration::ZERO;
+                        app.is_playing = true;
                     }
 
                     KeyCode::Char(' ') => { // boşluk tuşuna basıldığında şarkıyı duraklatmak veya devam ettirmek için kullanılan bir kod
                         if sink.is_paused(){ // şarkı duraklatılmışsa devam ettirmek için kullanılan bir kod
                             sink.play(); // şarkıyı devam ettirmek için kullanılan bir kod
+
+                            app.play_start = Some(Instant::now());
+                            app.is_playing = true;
                         } else { 
+                            if let Some(start) = app.play_start{
+                                app.paused_elapsed += start.elapsed();
+                            }
+
+                            app.play_start = None;
+                            app.is_playing = false;
                             sink.pause(); // şarkıyı duraklatmak için kullanılan bir kod
                         }
                     }
