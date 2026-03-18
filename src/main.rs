@@ -5,7 +5,9 @@ use ratatui::widgets::ListState; // terminal arayüzünde liste widget'ının du
 use ratatui::style::{Style, Color, Modifier}; // terminal arayüzünde stil ve renkler için kullanılan modül
 use std::time::Instant;
 use ratatui::widgets::Gauge;
-
+use rodio::{Decoder, OutputStream, Sink} ; // ses oynatma için kullanılan bir kütüphane
+use walkdir::WalkDir; // dosya sisteminde gezinmek için kullanılan bir kütüphane
+use std::io::stdout; // standart çıktı için kullanılan modül
 
 
 use crossterm::{ // terminal kontrolü için kullanılan bir kütüphane
@@ -21,12 +23,6 @@ use ratatui::{ // terminal arayüzü oluşturmak için kullanılan bir kütüpha
     Terminal, // terminali oluşturmak için kullanılan modül
 };
 
-use rodio::{Decoder, OutputStream, Sink} ; // ses oynatma için kullanılan bir kütüphane
-
-use walkdir::WalkDir; // dosya sisteminde gezinmek için kullanılan bir kütüphane
-
-use std::io::stdout; // standart çıktı için kullanılan modül
-
 struct App {    // uygulama sınıfı
     songs: Vec<String>, // şarkıların dosya yollarını tutan bir vektör
     selected: usize,  // seçili şarkının indeksini tutan bir değişken
@@ -35,6 +31,7 @@ struct App {    // uygulama sınıfı
     song_duration: Option<Duration>,
     is_playing: bool,
     paused_elapsed: Duration,
+    volume: f32, // ses seviyesini tutan bir değişken
 }
 
 fn load_songs(folder: &str) -> Vec<String>{ // belirtilen klasördeki mp3 dosyalarını yükleyen bir fonksiyon
@@ -83,6 +80,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
         song_duration: None,
         is_playing: false,
         paused_elapsed: Duration::ZERO,
+        volume: 1.0, // başlangıçta ses seviyesini 1.0 (maksimum) olarak ayarlamak için kullanılan bir kod
     };
 
     app.state.select(Some(0)); // başlangıçta ilk şarkıyı seçili olarak göstermek için kullanılan bir kod
@@ -127,8 +125,9 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
             let chunks = Layout::default() // terminal düzenini tanımlamak için kullanılan bir kod
                 .direction(Direction::Vertical) // dikey olarak oluşturmak için kullanılan bir kod
                 .constraints([
-                    Constraint::Min(3),
+                    Constraint::Min(3), 
                     Constraint::Length(3),
+                    Constraint::Length(3), 
                 ]) 
                 .split(f.size()); // terminal alanını bölmek için kullanılan bir kod
             
@@ -145,7 +144,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                 .collect(); // dosya yollarını bir vektörde toplamak için kullanılan bir kod
 
             let list = List::new(items) // list widget'ını oluşturmak için kullanılan bir kod
-                .block(Block::default().title("MP3 Player  [↑↓] Seç  [Enter] Oynat  [Space] Duraklat  [q] Çık ").borders(Borders::ALL)) // list widget'ının başlığını ve kenarlıklarını ayarlamak için kullanılan bir kod
+                .block(Block::default().title("MP3 Player  [↑↓] Seç  [Enter] Oynat  [Space] Duraklat  [q] Çık [+/-] Ses").borders(Borders::ALL)) // list widget'ının başlığını ve kenarlıklarını ayarlamak için kullanılan bir kod
                 .highlight_style( // seçili şarkının stilini ayarlamak için kullanılan bir kod
                     Style::default() // varsayılan stil
                         .bg(Color::Blue) // arka plan rengini mavi yapmak için kullanılan bir kod
@@ -170,6 +169,13 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                 .ratio(ratio);
             
             f.render_widget(gauge, chunks[1]);
+
+            let vol_gauge = Gauge::default()
+                .block(Block::default().title(format!(" Ses: {:.0}% ", app.volume * 100.0)).borders(Borders::ALL))
+                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+                .ratio((app.volume / 2.0) as f64);
+            f.render_widget(vol_gauge, chunks[2]);
+
         })?; // terminal arayüzünü güncellemek için kullanılan bir kod
 
         if event::poll(Duration::from_millis(200))? { // kullanıcı etkileşimlerini dinlemek için kullanılan bir kod
@@ -217,6 +223,16 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                             app.is_playing = false;
                             sink.pause(); // şarkıyı duraklatmak için kullanılan bir kod
                         }
+                    }
+
+                    KeyCode::Char('+') => {
+                        app.volume = (app.volume + 0.1).min(2.0);
+                        sink.set_volume(app.volume);
+                    }
+
+                    KeyCode::Char('-') => {
+                        app.volume = (app.volume - 0.1).max(0.0);
+                        sink.set_volume(app.volume);
                     }
 
                     _ => {} // diğer tuşlara basıldığında herhangi bir işlem yapmamak için kullanılan bir kod
