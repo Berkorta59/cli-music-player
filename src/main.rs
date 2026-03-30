@@ -6,7 +6,7 @@ use std::io::stdout;
 use std::path::PathBuf;
 
 use ratatui::widgets::ListState; 
-use ratatui::style::{Style, Color, Modifier}; l
+use ratatui::style::{Style, Color, Modifier};
 use ratatui::widgets::Gauge;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Clear;
@@ -42,7 +42,7 @@ enum AppMode {
 }
 
 struct App {    
-    songs: Vec<String>, /
+    songs: Vec<String>, 
     selected: usize,  
     state: ListState, 
     play_start: Option<Instant>,
@@ -83,6 +83,22 @@ fn play_song (path: &str, sink: &Sink) {
     let source = Decoder::new(file).unwrap(); 
     
     sink.append(source); 
+}
+
+fn play_selected_song(app: &mut App, sink: &Sink) {
+    if app.songs.is_empty(){
+        return;
+    }
+
+    sink.stop();
+    let current = &app.songs[app.selected];
+    play_song(current, sink);
+
+    app.album_art = get_album_art(current);
+    app.song_duration = get_mp3_duration(current);
+    app.play_start = Some(Instant::now());
+    app.is_playing = true;
+    app.paused_elapsed = Duration::ZERO;
 }
 
 fn format_duration(d: Duration) -> String {
@@ -336,7 +352,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> {
             let list = List::new(items) 
                 .block(Block::default()
                     .title(format!(
-                        "MP3 Player  [↑↓] Seç  [Enter] Oynat  [Space] Dur  [q] Çık  [+/-] Ses  [f] Klasör  │  📂 {}",
+                        "│ MP3 Player  [↑↓] Seç  [Enter] Oynat  [n] Next  [p] Prev  [Space] Dur  [q] Çık  [+/-] Ses  [f] Klasör  │ {}",
                         std::path::Path::new(&app.music_folder)
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
@@ -482,14 +498,26 @@ fn main() -> Result<(), Box <dyn std::error::Error>> {
                         }
 
                         KeyCode::Enter => {
-                            if !app.songs.is_empty(){
-                                sink.stop();
-                                play_song(&app.songs[app.selected], &sink);
-                                app.album_art = get_album_art(&app.songs[app.selected]);
-                                app.song_duration = get_mp3_duration(&app.songs[app.selected]);
-                                app.play_start = Some(Instant::now());
-                                app.is_playing = true;
-                                app.paused_elapsed = Duration::ZERO;
+                            play_selected_song(&mut app, &sink);
+                        }
+
+                        KeyCode::Char('n') => {
+                            if !app.songs.is_empty() {
+                                app.selected = (app.selected + 1) % app.songs.len();
+                                app.state.select(Some(app.selected));
+                                play_selected_song(&mut app, &sink);
+                            }
+                        }
+
+                        KeyCode::Char('p') => {
+                            if !app.songs.is_empty() {
+                                app.selected = if app.selected == 0 {
+                                    app.songs.len() - 1
+                                } else {
+                                    app.selected - 1
+                                };
+                                app.state.select(Some(app.selected));
+                                play_selected_song(&mut app, &sink);
                             }
                         }
 
