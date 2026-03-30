@@ -1,32 +1,32 @@
-use std::fs::File; // standart dosya sistemi modülünden file sınıfı import edildi
-use std::io::BufReader; // dosyaları daha verimli okumak için kullanılan bir sınıf
-use std::time::Duration; // süre ölçümü için kullanılan bir sınıf
+use std::fs::File; 
+use std::io::BufReader; 
+use std::time::Duration; 
 use std::time::Instant;
-use std::io::stdout; // standart çıktı için kullanılan modül
+use std::io::stdout; 
 use std::path::PathBuf;
 
-use ratatui::widgets::ListState; // terminal arayüzünde liste widget'ının durumunu tutmak için kullanılan bir sınıf
-use ratatui::style::{Style, Color, Modifier}; // terminal arayüzünde stil ve renkler için kullanılan modül
+use ratatui::widgets::ListState; 
+use ratatui::style::{Style, Color, Modifier}; l
 use ratatui::widgets::Gauge;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Clear;
 use ratatui::layout::Rect;
 
-use rodio::{Decoder, OutputStream, Sink} ; // ses oynatma için kullanılan bir kütüphane
-use walkdir::WalkDir; // dosya sisteminde gezinmek için kullanılan bir kütüphane
+use rodio::{Decoder, OutputStream, Sink} ; 
+use walkdir::WalkDir; 
 
 
-use crossterm::{ // terminal kontrolü için kullanılan bir kütüphane
-    event::{self, Event, KeyCode}, // terminaldeki olayları dinlemek için kullanılan modül
-    execute, // terminal komutlarını çalıştırmak için kullanılan modül
-    terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, // terminal modlarını kontrol etmek için kullanılan modül
+use crossterm::{ 
+    event::{self, Event, KeyCode}, 
+    execute, 
+    terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, 
 };
 
-use ratatui::{ // terminal arayüzü oluşturmak için kullanılan bir kütüphane
-    backend::CrosstermBackend, // crossterm ile uyumlu bir backend
-    layout::{Constraint, Direction, Layout}, // terminal düzeni için kullanılan modül
-    widgets::{Block, Borders, List, ListItem}, // terminaldeki widget'ları oluşturmak için kullanılan modül
-    Terminal, // terminali oluşturmak için kullanılan modül
+use ratatui::{ 
+    backend::CrosstermBackend, 
+    layout::{Constraint, Direction, Layout}, 
+    widgets::{Block, Borders, List, ListItem}, 
+    Terminal, 
 };
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -41,16 +41,16 @@ enum AppMode {
     PathInput,
 }
 
-struct App {    // uygulama sınıfı
-    songs: Vec<String>, // şarkıların dosya yollarını tutan bir vektör
-    selected: usize,  // seçili şarkının indeksini tutan bir değişken
-    state: ListState, // terminal arayüzünde liste widget'ının durumunu tutan bir değişken
+struct App {    
+    songs: Vec<String>, /
+    selected: usize,  
+    state: ListState, 
     play_start: Option<Instant>,
     song_duration: Option<Duration>,
     is_playing: bool,
     paused_elapsed: Duration,
-    volume: f32, // ses seviyesini tutan bir değişken
-    album_art: Option<Vec<u8>>, // albüm kapağı verisini tutan bir değişken
+    volume: f32, 
+    album_art: Option<Vec<u8>>, 
 
     music_folder: String,
     mode: AppMode,
@@ -62,27 +62,27 @@ struct App {    // uygulama sınıfı
     status_until: Option<Instant>,
 }
 
-fn load_songs(folder: &str) -> Vec<String>{ // belirtilen klasördeki mp3 dosyalarını yükleyen bir fonksiyon
-    let mut songs = Vec::new();  // şarkıların dosya yollarını tutan bir vektör
+fn load_songs(folder: &str) -> Vec<String>{ 
+    let mut songs = Vec::new();  
 
-    for entry in WalkDir::new(folder) { // klasördeki dosyaları gezmek için kullanılan bir döngü
-        let entry = entry.unwrap(); // dosya gezme işlemi sırasında oluşabilecek hataları yakalamak için unwrap kullanıldı
+    for entry in WalkDir::new(folder) { 
+        let entry = entry.unwrap(); 
 
-        if entry.path().extension().map(|s| s == "mp3").unwrap_or(false) { // dosyanın uzantısı mp3 ise
-            songs.push(entry.path().display().to_string()); // dosya yolunu string olarak vektöre eklemek için kullanılan bir kod
+        if entry.path().extension().map(|s| s == "mp3").unwrap_or(false) { 
+            songs.push(entry.path().display().to_string()); 
         }
     }
-    songs // şarkıların dosya yollarını içeren vektör döndürülür
+    songs 
 }
 fn get_mp3_duration(path: &str) -> Option<Duration> {
     mp3_duration::from_path(path).ok()
 }
 
-fn play_song (path: &str, sink: &Sink) { // belirtilen şarkıyı oynatan bir fonksiyon
-    let file = BufReader::new(File::open(path).unwrap()); // şarkı dosyasını açmak için kullanılan bir kod
-    let source = Decoder::new(file).unwrap(); // şarkı dosyasını decode etmek için kullanılan bir kod
+fn play_song (path: &str, sink: &Sink) { 
+    let file = BufReader::new(File::open(path).unwrap()); 
+    let source = Decoder::new(file).unwrap(); 
     
-    sink.append(source); // şarkıyı oynatmak için kullanılan bir kod
+    sink.append(source); 
 }
 
 fn format_duration(d: Duration) -> String {
@@ -188,7 +188,7 @@ fn load_config() -> Config {
     Config { music_folder: "./music".to_string() }
 }
 
-fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulamanın giriş noktası
+fn main() -> Result<(), Box <dyn std::error::Error>> { 
     
     let config = load_config();
     let initial_folder = {
@@ -216,16 +216,16 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
         .unwrap_or_else(|_| PathBuf::from("."));
     let browser_entries = read_browser_entries(&browser_start);
 
-    let mut app = App { // uygulama sınıfının bir örneği oluşturulur
-        songs, // şarkıların dosya yollarını içeren vektör
-        selected: 0, // başlangıçta seçili şarkının indeksini 0 olarak ayarlamak için kullanılan bir kod
-        state: ListState::default(), // liste widget'ının durumunu varsayılan olarak ayarlamak için kullanılan bir kod
+    let mut app = App { 
+        songs, 
+        selected: 0, 
+        state: ListState::default(), 
         play_start: None,
         song_duration: None,
         is_playing: false,
         paused_elapsed: Duration::ZERO,
-        volume: 1.0, // başlangıçta ses seviyesini 1.0 (maksimum) olarak ayarlamak için kullanılan bir kod
-        album_art: None, // başlangıçta albüm kapağı verisini None olarak ayarlamak için kullanılan bir kod
+        volume: 1.0, 
+        album_art: None, 
 
         music_folder: initial_folder.clone(),
         mode: AppMode::Normal,
@@ -245,18 +245,18 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
         app.state.select(Some(0));
     }
 
-    app.state.select(Some(0)); // başlangıçta ilk şarkıyı seçili olarak göstermek için kullanılan bir kod
+    app.state.select(Some(0)); 
 
-    let (_stream, stream_handle) = OutputStream::try_default()?; // ses çıkışını başlatmak için kullanılan bir kod
-    let sink = Sink::try_new(&stream_handle)?; // ses çıkışını kontrol etmek için kullanılan bir kod
+    let (_stream, stream_handle) = OutputStream::try_default()?; 
+    let sink = Sink::try_new(&stream_handle)?; 
 
-    enable_raw_mode()?; // terminali ham moduna geçirmek için kullanılan bir kod
-    execute!(stdout(), EnterAlternateScreen)?; // alternatif ekran moduna geçmek için kullanılan bir kod
+    enable_raw_mode()?; 
+    execute!(stdout(), EnterAlternateScreen)?; 
 
-    let backend = CrosstermBackend::new(stdout()); // crossterm backend'i oluşturmak için kullanılan bir kod
-    let mut terminal = Terminal::new(backend)?; // terminali oluşturmak için kullanılan bir kod
+    let backend = CrosstermBackend::new(stdout()); 
+    let mut terminal = Terminal::new(backend)?; 
 
-    loop { // ana döngü, kullanıcı etkileşimlerini dinlemek ve terminal arayüzünü güncellemek için kullanılır
+    loop { 
         if let Some(until) = app.status_until {
             if Instant::now() > until {
                 app.status_message = None;
@@ -289,7 +289,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
         
         
         
-        terminal.draw(|f| { // terminal arayüzü güncellemek için kullanılan bir kod
+        terminal.draw(|f| { 
 
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -309,9 +309,9 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                 .constraints([Constraint::Min(0), Constraint::Length(3), Constraint::Length(3)])
                 .split(bottom_chunks[1]);
             
-            let items: Vec<ListItem> = app // şarkıların dosya yollarını list item'lara dönüştürmek için kullanılan bir kod
-                .songs // şarkıların dosya yollarını içeren vektör
-                .iter() // şarkıların dosya yollarını iterasyon yapmak için kullanılan bir kod
+            let items: Vec<ListItem> = app
+                .songs
+                .iter()
                 .map(|s|{
                     let name = std::path::Path::new(s)
                         .file_name()
@@ -319,7 +319,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                         .unwrap_or_else(|| s.clone());
                     ListItem::new(name)
                 })
-                .collect(); // dosya yollarını bir vektörde toplamak için kullanılan bir kod
+                .collect();
 
             let art_block = Block::default().title(" Album ").borders(Borders::ALL);
             if let Some(art_data) = &app.album_art {
@@ -333,7 +333,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                 f.render_widget (placeholder, bottom_chunks[0]);
             }
 
-            let list = List::new(items) // list widget'ını oluşturmak için kullanılan bir kod
+            let list = List::new(items) 
                 .block(Block::default()
                     .title(format!(
                         "MP3 Player  [↑↓] Seç  [Enter] Oynat  [Space] Dur  [q] Çık  [+/-] Ses  [f] Klasör  │  📂 {}",
@@ -343,14 +343,14 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                             .unwrap_or_else(|| app.music_folder.clone())
                     ))
                     .borders(Borders::ALL))
-                .highlight_style( // seçili şarkının stilini ayarlamak için kullanılan bir kod
-                    Style::default() // varsayılan stil
-                        .bg(Color::Blue) // arka plan rengini mavi yapmak için kullanılan bir kod
-                        .fg(Color::White) // metin rengini beyaz yapmak için kullanılan bir kod
-                        .add_modifier(Modifier::BOLD) // metni kalın yapmak için kullanılan bir kod
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 )
-                .highlight_symbol(">> "); // seçili şarkının başına ">> " sembolü eklemek için kullanılan bir kod
-            f.render_stateful_widget(list, main_chunks[0], &mut app.state); // list widget'ını terminalde göstermek için kullanılan bir kod
+                .highlight_symbol(">> ");
+            f.render_stateful_widget(list, main_chunks[0], &mut app.state);
 
             let status_text = app.status_message.clone()
                 .unwrap_or_else(|| format!(" 📂 {}", app.music_folder));
@@ -386,7 +386,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
 
             if app.mode == AppMode::FolderBrowser {
                 let popup = centered_rect(72, 78, f.size());
-                f.render_widget(Clear, popup); // temiz bir arka plan için kullanılan bir widget
+                f.render_widget(Clear, popup); 
 
                 if app.mode == AppMode::PathInput{
                     let chunks = Layout::default()
@@ -451,9 +451,9 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
                 }
             }
 
-        })?; // terminal arayüzünü güncellemek için kullanılan bir kod
+        })?; 
 
-        if event::poll(Duration::from_millis(200))? { // kullanıcı etkileşimlerini dinlemek için kullanılan bir kod
+        if event::poll(Duration::from_millis(200))? { 
             if let Event::Key(key) = event::read()? {
                 match app.mode {
                     AppMode::Normal => match key.code {
@@ -640,7 +640,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> { // ana fonksiyon, uygulam
         }
     }
 
-    disable_raw_mode()?; // terminali normal moduna geri döndürmek için kullanılan bir kod
-    execute!(stdout(), LeaveAlternateScreen)?; // alternatif ekran modundan çıkmak için kullanılan bir kod
-    Ok(()) // uygulamanın başarılı bir şekilde tamamlandığını belirtmek için kullanılan bir kod
+    disable_raw_mode()?; 
+    execute!(stdout(), LeaveAlternateScreen)?; 
+    Ok(()) 
 }
