@@ -12,7 +12,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Clear;
 use ratatui::layout::Rect;
 
-use rodio::{Decoder, OutputStream, Sink} ; 
+use rodio::{Decoder, OutputStream, Sink, Source};
 use walkdir::WalkDir; 
 
 
@@ -99,6 +99,69 @@ fn play_selected_song(app: &mut App, sink: &Sink) {
     app.play_start = Some(Instant::now());
     app.is_playing = true;
     app.paused_elapsed = Duration::ZERO;
+}
+
+fn current_elapsed(app: &App) -> Duration {
+    if app.is_playing {
+        if let Some(start) = app.play_start {
+            app.paused_elapsed + start.elapsed()
+        } else {
+            app.paused_elapsed
+        }
+    } else{
+        app.paused_elapsed
+    }
+}
+
+fn seek_relative(app: &mut App, sink: &Sink, delta_secs: i64) {
+    if app.songs.is_empty(){
+        return;
+    }
+
+    let current = &app.songs[app.selected];
+    let total = app
+        .song_duration
+        .unwrap_or_else(|| get_mp3_duration(current).unwrap_or(Duration::ZERO));
+
+    if total.is_zero() {
+        return;
+    }
+
+    let now = current_elapsed(app);
+    let now_ms = now.as_millis() as i128;
+    let delta_ms = (delta_secs as i128) * 1000;
+    let total_ms = total.as_millis() as i128;
+
+    let target_ms = (now_ms + delta_ms).clamp(0, total_ms.saturating_sub(250));
+    let target = Duration::from_millis(target_ms as u64);
+
+    let file = match File::open(current) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let reader = BufReader::new(file);
+    let source = match Decoder::new(reader) {
+        Ok(s) => s.skip_duration(target),
+        Err(_) => return,
+    };
+
+    let was_paused = sink.is_paused();
+
+    sink.stop();
+    sink.append(source);
+    sink.set_volume(app.volume);
+
+    app.play_start = Some(Instant::now());
+    app.paused_elapsed = target;
+    app.song_duration = Some(total);
+    app.is_playing = !was_paused;
+
+    if was_paused {
+        sink.pause();
+    }else{
+        sink.play();
+    }
 }
 
 fn format_duration(d: Duration) -> String {
@@ -352,7 +415,7 @@ fn main() -> Result<(), Box <dyn std::error::Error>> {
             let list = List::new(items) 
                 .block(Block::default()
                     .title(format!(
-                        "│ MP3 Player  [↑↓] Seç  [Enter] Oynat  [n] Next  [p] Prev  [Space] Dur  [q] Çık  [+/-] Ses  [f] Klasör  │ {}",
+                        "│ MP3 Player  [↑↓] Seç  [Enter] Oynat  [n] Next  [p] Prev  [←] -5sn  [→] +5sn  [Space] Dur  [q] Çık  [+/-] Ses  [f] Klasör │ {}",
                         std::path::Path::new(&app.music_folder)
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
@@ -495,6 +558,14 @@ fn main() -> Result<(), Box <dyn std::error::Error>> {
                                 app.selected -= 1;
                                 app.state.select(Some(app.selected));
                             }
+                        }
+
+                        KeyCode::Left => {
+                            seek_relative(&mut app, &sink, -5);
+                        }
+
+                        KeyCode::Right => {
+                            seek_relative(&mut app, &sink, 5);
                         }
 
                         KeyCode::Enter => {
