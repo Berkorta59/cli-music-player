@@ -35,6 +35,12 @@ use walkdir::WalkDir;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Config {
     music_folder: String,
+    #[serde(default = "default_theme_name")]
+    theme: String,
+}
+
+fn default_theme_name() -> String {
+    "retro-terminal".to_string()
 }
 
 #[derive(Clone)]
@@ -165,6 +171,133 @@ enum AppTab {
     Search,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepeatMode {
+    Off,
+    Track,
+    Playlist,
+}
+
+impl RepeatMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Repeat Off",
+            Self::Track => "Repeat One",
+            Self::Playlist => "Repeat Playlist",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Track,
+            Self::Track => Self::Playlist,
+            Self::Playlist => Self::Off,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    Minimal,
+    RetroTerminal,
+    Monochrome,
+}
+
+impl ThemeMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Minimal => "Minimal",
+            Self::RetroTerminal => "Retro Terminal",
+            Self::Monochrome => "Monochrome",
+        }
+    }
+
+    fn config_value(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::RetroTerminal => "retro-terminal",
+            Self::Monochrome => "monochrome",
+        }
+    }
+
+    fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "minimal" => Self::Minimal,
+            "monochrome" => Self::Monochrome,
+            _ => Self::RetroTerminal,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Minimal => Self::RetroTerminal,
+            Self::RetroTerminal => Self::Monochrome,
+            Self::Monochrome => Self::Minimal,
+        }
+    }
+
+    fn as_index(self) -> usize {
+        match self {
+            Self::Minimal => 0,
+            Self::RetroTerminal => 1,
+            Self::Monochrome => 2,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Minimal,
+            2 => Self::Monochrome,
+            _ => Self::RetroTerminal,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ThemePalette {
+    primary: Color,
+    secondary: Color,
+    accent: Color,
+    deep_bg: Color,
+    panel_bg: Color,
+    muted_fg: Color,
+}
+
+static ACTIVE_THEME: AtomicUsize = AtomicUsize::new(1);
+
+fn active_theme() -> ThemeMode {
+    ThemeMode::from_index(ACTIVE_THEME.load(Ordering::Relaxed))
+}
+
+fn theme_palette(theme: ThemeMode) -> ThemePalette {
+    match theme {
+        ThemeMode::Minimal => ThemePalette {
+            primary: Color::Rgb(92, 120, 156),
+            secondary: Color::Rgb(122, 146, 176),
+            accent: Color::Rgb(168, 186, 208),
+            deep_bg: Color::Rgb(18, 22, 28),
+            panel_bg: Color::Rgb(30, 36, 44),
+            muted_fg: Color::Rgb(154, 164, 176),
+        },
+        ThemeMode::RetroTerminal => ThemePalette {
+            primary: Color::Rgb(121, 255, 102),
+            secondary: Color::Rgb(86, 211, 255),
+            accent: Color::Rgb(255, 203, 94),
+            deep_bg: Color::Rgb(8, 16, 9),
+            panel_bg: Color::Rgb(18, 32, 20),
+            muted_fg: Color::Rgb(145, 185, 135),
+        },
+        ThemeMode::Monochrome => ThemePalette {
+            primary: Color::Rgb(225, 225, 225),
+            secondary: Color::Rgb(180, 180, 180),
+            accent: Color::Rgb(245, 245, 245),
+            deep_bg: Color::Rgb(12, 12, 12),
+            panel_bg: Color::Rgb(24, 24, 24),
+            muted_fg: Color::Rgb(130, 130, 130),
+        },
+    }
+}
+
 impl AppTab {
     fn all() -> [Self; 8] {
         [
@@ -222,32 +355,34 @@ struct App {
     path_input: String,
     shuffle_enabled: bool,
     shuffle_history: Vec<usize>,
+    repeat_mode: RepeatMode,
+    theme_mode: ThemeMode,
     status_message: Option<String>,
     status_until: Option<Instant>,
 }
 
 fn neon_blue() -> Color {
-    Color::Rgb(106, 163, 255)
+    theme_palette(active_theme()).primary
 }
 
 fn neon_purple() -> Color {
-    Color::Rgb(171, 108, 255)
+    theme_palette(active_theme()).secondary
 }
 
 fn neon_pink() -> Color {
-    Color::Rgb(255, 82, 182)
+    theme_palette(active_theme()).accent
 }
 
 fn deep_bg() -> Color {
-    Color::Rgb(12, 14, 27)
+    theme_palette(active_theme()).deep_bg
 }
 
 fn panel_bg() -> Color {
-    Color::Rgb(20, 24, 42)
+    theme_palette(active_theme()).panel_bg
 }
 
 fn muted_fg() -> Color {
-    Color::Rgb(144, 154, 196)
+    theme_palette(active_theme()).muted_fg
 }
 
 fn primary_block(title: impl Into<Line<'static>>) -> Block<'static> {
@@ -599,6 +734,12 @@ fn advance_to_next_track(app: &mut App, sink: &Sink) {
         return;
     }
 
+    if app.repeat_mode == RepeatMode::Track {
+        let replay_idx = app.current_track.unwrap_or(app.selected);
+        play_track_at(app, sink, replay_idx);
+        return;
+    }
+
     if app.shuffle_enabled {
         let from = app.current_track.unwrap_or(app.selected);
         if let Some(next_idx) = pick_shuffle_next(app) {
@@ -609,8 +750,19 @@ fn advance_to_next_track(app: &mut App, sink: &Sink) {
         }
     } else {
         let base = app.current_track.unwrap_or(app.selected);
-        let next_idx = (base + 1) % app.songs.len();
-        play_track_at(app, sink, next_idx);
+        if base + 1 < app.songs.len() {
+            play_track_at(app, sink, base + 1);
+        } else if app.repeat_mode == RepeatMode::Playlist {
+            play_track_at(app, sink, 0);
+        } else {
+            sink.stop();
+            app.is_playing = false;
+            app.play_start = None;
+            app.paused_elapsed = app.song_duration.unwrap_or(Duration::ZERO);
+            app.active_playback = None;
+            app.status_message = Some("Playback finished (Repeat Off)".to_string());
+            app.status_until = Some(Instant::now() + Duration::from_secs(3));
+        }
     }
 }
 
@@ -729,6 +881,7 @@ fn load_config() -> Config {
 
     Config {
         music_folder: "./music".to_string(),
+        theme: default_theme_name(),
     }
 }
 
@@ -800,7 +953,7 @@ fn panel_lines(app: &App) -> Vec<Line<'static>> {
                     Style::default().fg(Color::White),
                 )]),
                 Line::from(vec![Span::styled(
-                    "Enter play, Space toggle, Left/Right seek, R shuffle, Tab sections.",
+                    "Enter play, Space toggle, Left/Right seek, R shuffle, M repeat, H theme.",
                     Style::default().fg(muted_fg()),
                 )]),
             ]
@@ -967,7 +1120,7 @@ fn volume_meter(volume: f32) -> String {
     glyphs.iter().take(steps.min(glyphs.len())).collect()
 }
 
-fn render_now_playing_bar(f: &mut ratatui::Frame, area: Rect, app: &App, progress_ratio: f64) {
+fn render_now_playing_bar(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let block = primary_block(Line::from(vec![Span::styled(
         " Now Playing ",
         Style::default()
@@ -980,9 +1133,9 @@ fn render_now_playing_bar(f: &mut ratatui::Frame, area: Rect, app: &App, progres
     let sections = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Length(30),
+            Constraint::Min(24),
             Constraint::Length(18),
-            Constraint::Min(34),
-            Constraint::Length(22),
         ])
         .split(inner);
 
@@ -996,14 +1149,19 @@ fn render_now_playing_bar(f: &mut ratatui::Frame, area: Rect, app: &App, progres
     } else {
         "Shuffle Off"
     };
+    let playback_modes = format!("{} | {}", shuffle_text, app.repeat_mode.label());
+    let theme_text = format!("Theme: {}", app.theme_mode.label());
     let left_text = Paragraph::new(vec![Line::from(vec![Span::styled(
         state_text,
         Style::default()
             .fg(neon_pink())
             .add_modifier(Modifier::BOLD),
     )]), Line::from(vec![Span::styled(
-        shuffle_text,
+        playback_modes,
         Style::default().fg(neon_blue()),
+    )]), Line::from(vec![Span::styled(
+        theme_text,
+        Style::default().fg(neon_purple()),
     )])])
     .style(Style::default().bg(panel_bg()));
     f.render_widget(left_text, sections[0]);
@@ -1016,11 +1174,6 @@ fn render_now_playing_bar(f: &mut ratatui::Frame, area: Rect, app: &App, progres
         .map(|item| format!("{}  •  {}", item.artist, item.album))
         .unwrap_or_else(|| "Queue, browse, and press Enter to play".to_string());
 
-    let center = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(1)])
-        .split(sections[1]);
-
     let title_widget = Paragraph::new(vec![
         Line::from(vec![Span::styled(
             title,
@@ -1032,18 +1185,7 @@ fn render_now_playing_bar(f: &mut ratatui::Frame, area: Rect, app: &App, progres
     ])
     .alignment(Alignment::Center)
     .style(Style::default().bg(panel_bg()));
-    f.render_widget(title_widget, center[0]);
-
-    let pulse = Gauge::default()
-        .gauge_style(Style::default().fg(neon_blue()).bg(deep_bg()))
-        .ratio(progress_ratio)
-        .label(Span::styled(
-            format!("{:.0}%", progress_ratio * 100.0),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(pulse, center[1]);
+    f.render_widget(title_widget, sections[1]);
 
     let volume_box = Paragraph::new(vec![
         Line::from(vec![
@@ -1352,6 +1494,10 @@ fn render_footer(
         Span::styled(" sections   ", Style::default().fg(muted_fg())),
         Span::styled("r", Style::default().fg(neon_blue())),
         Span::styled(" shuffle   ", Style::default().fg(muted_fg())),
+        Span::styled("m", Style::default().fg(neon_blue())),
+        Span::styled(" repeat   ", Style::default().fg(muted_fg())),
+        Span::styled("h", Style::default().fg(neon_blue())),
+        Span::styled(" theme   ", Style::default().fg(muted_fg())),
         Span::styled("f", Style::default().fg(neon_blue())),
         Span::styled(" folder", Style::default().fg(muted_fg())),
     ]))
@@ -1464,6 +1610,8 @@ fn render_browser_popup(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config();
+    let initial_theme = ThemeMode::from_config(&config.theme);
+    ACTIVE_THEME.store(initial_theme.as_index(), Ordering::Relaxed);
     let initial_folder = {
         let path = PathBuf::from(&config.music_folder);
         if path.is_dir() {
@@ -1525,6 +1673,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path_input: String::new(),
         shuffle_enabled: false,
         shuffle_history: Vec::new(),
+        repeat_mode: RepeatMode::Off,
+        theme_mode: initial_theme,
         status_message: initial_status,
         status_until: Some(
             Instant::now() + Duration::from_secs(if songs_are_empty { 10 } else { 4 }),
@@ -1586,7 +1736,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ])
                 .split(f.size());
 
-            render_now_playing_bar(f, sections[0], &app, ratio);
+            render_now_playing_bar(f, sections[0], &app);
 
             let content = Layout::default()
                 .direction(Direction::Horizontal)
@@ -1690,6 +1840,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
                             app.status_until = Some(Instant::now() + Duration::from_secs(3));
                         }
+                        KeyCode::Char('m') => {
+                            app.repeat_mode = app.repeat_mode.next();
+                            app.status_message = Some(format!(
+                                "Repeat mode: {}",
+                                app.repeat_mode.label()
+                            ));
+                            app.status_until = Some(Instant::now() + Duration::from_secs(3));
+                        }
+                        KeyCode::Char('h') => {
+                            app.theme_mode = app.theme_mode.next();
+                            ACTIVE_THEME.store(app.theme_mode.as_index(), Ordering::Relaxed);
+                            save_config(&Config {
+                                music_folder: app.music_folder.clone(),
+                                theme: app.theme_mode.config_value().to_string(),
+                            });
+                            app.status_message = Some(format!(
+                                "Theme switched to {}",
+                                app.theme_mode.label()
+                            ));
+                            app.status_until = Some(Instant::now() + Duration::from_secs(3));
+                        }
                         KeyCode::Char('n') => {
                             if !app.songs.is_empty() {
                                 advance_to_next_track(&mut app, &sink);
@@ -1788,6 +1959,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 save_config(&Config {
                                     music_folder: new_folder.clone(),
+                                    theme: app.theme_mode.config_value().to_string(),
                                 });
                                 sink.stop();
                                 app.music_folder = new_folder;
@@ -1863,6 +2035,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     save_config(&Config {
                                         music_folder: new_folder.clone(),
+                                        theme: app.theme_mode.config_value().to_string(),
                                     });
                                     sink.stop();
                                     app.music_folder = new_folder;
