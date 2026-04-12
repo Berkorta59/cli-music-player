@@ -674,10 +674,14 @@ fn seek_relative(app: &mut App, sink: &Sink, delta_secs: i64) {
         return;
     };
 
-    let current = &app.songs[current_idx];
+    let (current_path, current_duration) = {
+        let current = &app.songs[current_idx];
+        (current.path.clone(), current.duration)
+    };
+
     let total = app
         .song_duration
-        .unwrap_or_else(|| current.duration.unwrap_or(Duration::ZERO));
+        .unwrap_or_else(|| current_duration.unwrap_or(Duration::ZERO));
 
     if total.is_zero() {
         return;
@@ -699,6 +703,35 @@ fn seek_relative(app: &mut App, sink: &Sink, delta_secs: i64) {
 
     if switch_to_seekable_cached_source(app, sink, target) {
         return;
+    }
+
+    // If early seeks happen before background decode is ready, force one decode now
+    // so subsequent seek operations use the cached source instead of re-decoding stream.
+    let should_force_decode = app
+        .pending_decode
+        .as_ref()
+        .map(|pending| pending.track_idx == current_idx)
+        .unwrap_or(false)
+        && app
+            .decoded_track
+            .as_ref()
+            .map(|decoded| decoded.track_idx != current_idx)
+            .unwrap_or(true);
+
+    if should_force_decode {
+        if let Some((samples, channels, sample_rate)) = decode_song_buffer(&current_path) {
+            app.pending_decode = None;
+            app.decoded_track = Some(DecodedTrack {
+                track_idx: current_idx,
+                samples,
+                channels,
+                sample_rate,
+            });
+
+            if switch_to_seekable_cached_source(app, sink, target) {
+                return;
+            }
+        }
     }
 
     seek_with_stream_decoder(app, sink, target);
