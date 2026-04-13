@@ -12,10 +12,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use id3::{Tag, TagLike};
 use image::{GenericImageView, imageops::FilterType};
 use rand::seq::SliceRandom;
@@ -544,6 +545,9 @@ struct App {
     playlists: Vec<Playlist>,
     playlist_state: ListState,
     playlist_name_input: String,
+    search_query: String,
+    search_hits: Vec<(usize, i64)>,
+    search_state: TableState,
 }
 
 fn neon_blue() -> Color {
@@ -1321,6 +1325,59 @@ fn refresh_library_metrics(app: &mut App) {
     app.genre_counts = summarize_counts(&app.songs, |song| song.genre.clone());
 }
 
+fn refresh_search_hits(app: &mut App) {
+    let query = app.search_query.trim();
+
+    if query.is_empty() {
+        app.search_hits = app
+            .songs
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| (idx, 0))
+            .collect();
+    } else {
+        let matcher = SkimMatcherV2::default().smart_case();
+        let mut hits = Vec::new();
+
+        for (idx, song) in app.songs.iter().enumerate() {
+            let title_score = matcher.fuzzy_match(&song.title, query);
+            let artist_score = matcher.fuzzy_match(&song.artist, query);
+            let album_score = matcher.fuzzy_match(&song.album, query);
+
+            let best = [title_score, artist_score, album_score]
+                .into_iter()
+                .flatten()
+                .max();
+
+            if let Some(score) = best {
+                hits.push((idx, score));
+            }
+        }
+
+        hits.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| app.songs[left.0].title.cmp(&app.songs[right.0].title))
+                .then_with(|| app.songs[left.0].path.cmp(&app.songs[right.0].path))
+        });
+        app.search_hits = hits;
+    }
+
+    let selected = app.search_state.selected().unwrap_or(0);
+    if app.search_hits.is_empty() {
+        app.search_state.select(None);
+    } else {
+        app.search_state
+            .select(Some(selected.min(app.search_hits.len() - 1)));
+    }
+}
+
+fn selected_search_track(app: &App) -> Option<usize> {
+    let selected_hit = app.search_state.selected().unwrap_or(0);
+    app.search_hits.get(selected_hit).map(|(idx, _)| *idx)
+}
+
 fn panel_lines(app: &App) -> Vec<Line<'static>> {
     match app.active_tab {
         AppTab::Queue => {
@@ -1451,14 +1508,20 @@ fn panel_lines(app: &App) -> Vec<Line<'static>> {
                     .fg(neon_blue())
                     .add_modifier(Modifier::BOLD),
             )]),
-            Line::from(format!("Library indexed: {} tracks", app.songs.len())),
             Line::from(format!(
-                "Artists: {}  Albums: {}  Genres: {}",
-                app.artist_counts.len(),
-                app.album_counts.len(),
-                app.genre_counts.len(),
+                "Query: {}",
+                if app.search_query.is_empty() {
+                    "(type to search artist/album/title)".to_string()
+                } else {
+                    app.search_query.clone()
+                }
             )),
-            Line::from("Use the tabs as discovery surfaces while keeping Queue playback active."),
+            Line::from(format!(
+                "Matches: {} / {} tracks",
+                app.search_hits.len(),
+                app.songs.len(),
+            )),
+            Line::from("Type to filter live. Enter plays selected result. Backspace deletes."),
         ],
     }
 }
@@ -1747,6 +1810,76 @@ fn render_track_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             )
             .highlight_symbol("▍ ");
         f.render_stateful_widget(playlist_list, chunks[1], &mut app.playlist_state);
+        return;
+    }
+
+    if app.active_tab == AppTab::Search {
+        if app.search_hits.is_empty() {
+            let empty = Paragraph::new(vec![
+                Line::from("No matching tracks found."),
+                Line::from("Try a broader fuzzy query (artist, album, or title)."),
+            ])
+            .block(primary_block(Line::from(vec![Span::styled(
+                " Search Results ",
+                Style::default()
+                    .fg(neon_blue())
+                    .add_modifier(Modifier::BOLD),
+            )])))
+            .style(Style::default().fg(muted_fg()))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+            f.render_widget(empty, chunks[1]);
+            return;
+        }
+
+        let rows: Vec<Row> = app
+            .search_hits
+            .iter()
+            .take(250)
+            .map(|(idx, score)| {
+                let song = &app.songs[*idx];
+                Row::new(vec![
+                    Cell::from(format!("{}", score)),
+                    Cell::from(song.artist.as_str()),
+                    Cell::from(song.title.as_str()),
+                    Cell::from(song.album.as_str()),
+                    Cell::from(song.duration_label.as_str()),
+                ])
+            })
+            .collect();
+
+        let search_table = Table::new(
+            rows,
+            [
+                Constraint::Length(6),
+                Constraint::Length(18),
+                Constraint::Percentage(32),
+                Constraint::Percentage(32),
+                Constraint::Length(9),
+            ],
+        )
+        .header(
+            Row::new(vec!["Score", "Artist", "Title", "Album", "Duration"]).style(
+                Style::default()
+                    .fg(neon_blue())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(primary_block(Line::from(vec![Span::styled(
+            " Search Results ",
+            Style::default()
+                .fg(neon_blue())
+                .add_modifier(Modifier::BOLD),
+        )])))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(132, 174, 255))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▍ ")
+        .column_spacing(1);
+        f.render_stateful_widget(search_table, chunks[1], &mut app.search_state);
         return;
     }
 
@@ -2162,12 +2295,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         playlists: load_playlists(),
         playlist_state: ListState::default(),
         playlist_name_input: String::new(),
+        search_query: String::new(),
+        search_hits: Vec::new(),
+        search_state: TableState::default(),
     };
 
     if !app.songs.is_empty() {
         app.table_state.select(Some(0));
     }
     refresh_library_metrics(&mut app);
+    refresh_search_hits(&mut app);
 
     let (_stream, stream_handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&stream_handle)?;
@@ -2276,7 +2413,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(key) = event::read()? {
                 match app.mode {
-                    AppMode::Normal => match key.code {
+                    AppMode::Normal => {
+                        if app.active_tab == AppTab::Search {
+                            match key.code {
+                                KeyCode::Tab => {
+                                    app.active_tab = next_tab(app.active_tab);
+                                    continue;
+                                }
+                                KeyCode::BackTab => {
+                                    app.active_tab = previous_tab(app.active_tab);
+                                    continue;
+                                }
+                                KeyCode::Down => {
+                                    if !app.search_hits.is_empty() {
+                                        let next = (app.search_state.selected().unwrap_or(0) + 1)
+                                            .min(app.search_hits.len() - 1);
+                                        app.search_state.select(Some(next));
+                                    }
+                                    continue;
+                                }
+                                KeyCode::Up => {
+                                    let cur = app.search_state.selected().unwrap_or(0);
+                                    if cur > 0 {
+                                        app.search_state.select(Some(cur - 1));
+                                    }
+                                    continue;
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(track_idx) = selected_search_track(&app) {
+                                        app.selected = track_idx;
+                                        app.table_state.select(Some(track_idx));
+                                        play_selected_song(&mut app, &sink);
+                                    }
+                                    continue;
+                                }
+                                KeyCode::Backspace => {
+                                    if !app.search_query.is_empty() {
+                                        app.search_query.pop();
+                                        refresh_search_hits(&mut app);
+                                    }
+                                    continue;
+                                }
+                                KeyCode::Esc => {
+                                    app.search_query.clear();
+                                    refresh_search_hits(&mut app);
+                                    continue;
+                                }
+                                KeyCode::Char('q')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    break;
+                                }
+                                KeyCode::Char(c) => {
+                                    app.search_query.push(c);
+                                    refresh_search_hits(&mut app);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('f') => {
                             app.browser_path = PathBuf::from(&app.music_folder)
@@ -2293,10 +2490,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             app.active_tab = previous_tab(app.active_tab);
                         }
                         KeyCode::Down => {
-                            if app.active_tab == AppTab::Queue && app.selected + 1 < app.songs.len()
-                            {
+                            if app.active_tab == AppTab::Queue && app.selected + 1 < app.songs.len() {
                                 app.selected += 1;
                                 app.table_state.select(Some(app.selected));
+                            } else if app.active_tab == AppTab::Search && !app.search_hits.is_empty() {
+                                let next = (app.search_state.selected().unwrap_or(0) + 1)
+                                    .min(app.search_hits.len() - 1);
+                                app.search_state.select(Some(next));
                             } else if app.active_tab == AppTab::Playlists
                                 && !app.playlists.is_empty()
                             {
@@ -2309,6 +2509,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if app.active_tab == AppTab::Queue && app.selected > 0 {
                                 app.selected -= 1;
                                 app.table_state.select(Some(app.selected));
+                            } else if app.active_tab == AppTab::Search {
+                                let cur = app.search_state.selected().unwrap_or(0);
+                                if cur > 0 {
+                                    app.search_state.select(Some(cur - 1));
+                                }
                             } else if app.active_tab == AppTab::Playlists {
                                 let cur = app.playlist_state.selected().unwrap_or(0);
                                 if cur > 0 {
@@ -2327,6 +2532,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let idx = app.playlist_state.selected().unwrap_or(0);
                                 if !app.playlists.is_empty() {
                                     load_playlist_into_queue(&mut app, &sink, idx, false);
+                                }
+                            } else if app.active_tab == AppTab::Search {
+                                if let Some(track_idx) = selected_search_track(&app) {
+                                    app.selected = track_idx;
+                                    app.table_state.select(Some(track_idx));
+                                    play_selected_song(&mut app, &sink);
                                 }
                             } else {
                                 play_selected_song(&mut app, &sink);
@@ -2472,7 +2683,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             sink.set_volume(app.volume);
                         }
                         _ => {}
-                    },
+                    }
+                    }
                     AppMode::FolderBrowser => match key.code {
                         KeyCode::Esc => {
                             app.mode = AppMode::Normal;
@@ -2536,6 +2748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.shuffle_history.clear();
                                 app.play_queue.clear();
                                 refresh_library_metrics(&mut app);
+                                refresh_search_hits(&mut app);
                                 app.status_message =
                                     Some(format!("{} tracks loaded", app.songs.len()));
                                 app.status_until = Some(Instant::now() + Duration::from_secs(3));
@@ -2613,6 +2826,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.shuffle_history.clear();
                                     app.play_queue.clear();
                                     refresh_library_metrics(&mut app);
+                                    refresh_search_hits(&mut app);
                                     app.status_message =
                                         Some(format!("{} tracks loaded", app.songs.len()));
                                     app.status_until =
