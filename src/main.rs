@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, stdout};
 use std::path::{Path, PathBuf};
@@ -566,7 +566,7 @@ struct App {
     path_input: String,
     shuffle_enabled: bool,
     shuffle_history: Vec<usize>,
-    play_queue: Vec<usize>,
+    play_queue: VecDeque<usize>,
     visualizer: Arc<Mutex<VisualizerState>>,
     repeat_mode: RepeatMode,
     theme_mode: ThemeMode,
@@ -973,8 +973,7 @@ fn play_track_at(app: &mut App, sink: &Sink, track_idx: usize) {
 }
 
 fn pop_next_queued(app: &mut App) -> Option<usize> {
-    while !app.play_queue.is_empty() {
-        let idx = app.play_queue.remove(0);
+    while let Some(idx) = app.play_queue.pop_front() {
         if idx < app.songs.len() {
             return Some(idx);
         }
@@ -998,10 +997,10 @@ fn enqueue_selected_track(app: &mut App, play_next: bool) {
         .unwrap_or_else(|| "Unknown Track".to_string());
 
     if play_next {
-        app.play_queue.insert(0, idx);
+        app.play_queue.push_front(idx);
         app.status_message = Some(format!("Play next: {}", title));
     } else {
-        app.play_queue.push(idx);
+        app.play_queue.push_back(idx);
         app.status_message = Some(format!("Queued: {}", title));
     }
     app.status_until = Some(Instant::now() + Duration::from_secs(3));
@@ -1364,6 +1363,41 @@ fn save_config(cfg: &Config) {
     if let Ok(json) = serde_json::to_string_pretty(cfg) {
         let _ = std::fs::write(&path, json);
     }
+}
+
+fn persist_config(music_folder: &str, theme_mode: ThemeMode) {
+    save_config(&Config {
+        music_folder: music_folder.to_string(),
+        theme: theme_mode.config_value().to_string(),
+    });
+}
+
+fn replace_library(app: &mut App, sink: &Sink, music_folder: String, songs: Vec<Song>) {
+    persist_config(&music_folder, app.theme_mode);
+    sink.stop();
+
+    app.music_folder = music_folder;
+    app.songs = songs;
+    app.selected = 0;
+    app.table_state = TableState::default();
+    app.table_state.select(Some(0));
+    app.current_track = None;
+    app.play_start = None;
+    app.song_duration = None;
+    app.is_playing = false;
+    app.paused_elapsed = Duration::ZERO;
+    app.active_playback = None;
+    app.decoded_track = None;
+    app.pending_decode = None;
+    app.album_art = None;
+    app.album_art_cache = None;
+    app.shuffle_history.clear();
+    app.play_queue.clear();
+    refresh_library_metrics(app);
+    refresh_search_hits(app);
+    app.status_message = Some(format!("{} tracks loaded", app.songs.len()));
+    app.status_until = Some(Instant::now() + Duration::from_secs(3));
+    app.mode = AppMode::Normal;
 }
 
 fn read_browser_entries(path: &PathBuf) -> Vec<PathBuf> {
@@ -2432,7 +2466,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path_input: String::new(),
         shuffle_enabled: false,
         shuffle_history: Vec::new(),
-        play_queue: Vec::new(),
+        play_queue: VecDeque::new(),
         visualizer,
         repeat_mode: RepeatMode::Off,
         theme_mode: initial_theme,
@@ -2772,10 +2806,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if app.theme_mode == ThemeMode::Custom {
                                 apply_custom_theme_from_file(&mut app, true);
                             }
-                            save_config(&Config {
-                                music_folder: app.music_folder.clone(),
-                                theme: app.theme_mode.config_value().to_string(),
-                            });
+                            persist_config(&app.music_folder, app.theme_mode);
                             if app.theme_mode != ThemeMode::Custom {
                                 app.status_message = Some(format!(
                                     "Theme switched to {}",
@@ -2881,34 +2912,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Some(format!("No mp3 files found in '{}'", new_folder));
                                 app.status_until = Some(Instant::now() + Duration::from_secs(5));
                             } else {
-                                save_config(&Config {
-                                    music_folder: new_folder.clone(),
-                                    theme: app.theme_mode.config_value().to_string(),
-                                });
-                                sink.stop();
-                                app.music_folder = new_folder;
-                                app.songs = new_songs;
-                                app.selected = 0;
-                                app.table_state = TableState::default();
-                                app.table_state.select(Some(0));
-                                app.current_track = None;
-                                app.is_playing = false;
-                                app.play_start = None;
-                                app.paused_elapsed = Duration::ZERO;
-                                app.song_duration = None;
-                                app.active_playback = None;
-                                app.decoded_track = None;
-                                app.pending_decode = None;
-                                app.album_art = None;
-                                app.album_art_cache = None;
-                                app.shuffle_history.clear();
-                                app.play_queue.clear();
-                                refresh_library_metrics(&mut app);
-                                refresh_search_hits(&mut app);
-                                app.status_message =
-                                    Some(format!("{} tracks loaded", app.songs.len()));
-                                app.status_until = Some(Instant::now() + Duration::from_secs(3));
-                                app.mode = AppMode::Normal;
+                                replace_library(&mut app, &sink, new_folder, new_songs);
                             }
                         }
                         KeyCode::Char('t') => {
@@ -2959,35 +2963,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.status_until =
                                         Some(Instant::now() + Duration::from_secs(5));
                                 } else {
-                                    save_config(&Config {
-                                        music_folder: new_folder.clone(),
-                                        theme: app.theme_mode.config_value().to_string(),
-                                    });
-                                    sink.stop();
-                                    app.music_folder = new_folder;
-                                    app.songs = new_songs;
-                                    app.selected = 0;
-                                    app.table_state = TableState::default();
-                                    app.table_state.select(Some(0));
-                                    app.current_track = None;
-                                    app.is_playing = false;
-                                    app.play_start = None;
-                                    app.paused_elapsed = Duration::ZERO;
-                                    app.song_duration = None;
-                                    app.active_playback = None;
-                                    app.decoded_track = None;
-                                    app.pending_decode = None;
-                                    app.album_art = None;
-                                    app.album_art_cache = None;
-                                    app.shuffle_history.clear();
-                                    app.play_queue.clear();
-                                    refresh_library_metrics(&mut app);
-                                    refresh_search_hits(&mut app);
-                                    app.status_message =
-                                        Some(format!("{} tracks loaded", app.songs.len()));
-                                    app.status_until =
-                                        Some(Instant::now() + Duration::from_secs(3));
-                                    app.mode = AppMode::Normal;
+                                    replace_library(&mut app, &sink, new_folder, new_songs);
                                 }
                             }
                         }
