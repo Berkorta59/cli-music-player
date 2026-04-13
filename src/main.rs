@@ -9,7 +9,7 @@ use std::sync::{
     Mutex,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -40,6 +40,16 @@ struct Config {
     music_folder: String,
     #[serde(default = "default_theme_name")]
     theme: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ThemeFile {
+    primary: [u8; 3],
+    secondary: [u8; 3],
+    accent: [u8; 3],
+    deep_bg: [u8; 3],
+    panel_bg: [u8; 3],
+    muted_fg: [u8; 3],
 }
 
 fn default_theme_name() -> String {
@@ -383,6 +393,7 @@ enum ThemeMode {
     Minimal,
     RetroTerminal,
     Monochrome,
+    Custom,
 }
 
 impl ThemeMode {
@@ -391,6 +402,7 @@ impl ThemeMode {
             Self::Minimal => "Minimal",
             Self::RetroTerminal => "Retro Terminal",
             Self::Monochrome => "Monochrome",
+            Self::Custom => "Custom JSON",
         }
     }
 
@@ -399,6 +411,7 @@ impl ThemeMode {
             Self::Minimal => "minimal",
             Self::RetroTerminal => "retro-terminal",
             Self::Monochrome => "monochrome",
+            Self::Custom => "custom",
         }
     }
 
@@ -406,6 +419,7 @@ impl ThemeMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "minimal" => Self::Minimal,
             "monochrome" => Self::Monochrome,
+            "custom" => Self::Custom,
             _ => Self::RetroTerminal,
         }
     }
@@ -414,7 +428,8 @@ impl ThemeMode {
         match self {
             Self::Minimal => Self::RetroTerminal,
             Self::RetroTerminal => Self::Monochrome,
-            Self::Monochrome => Self::Minimal,
+            Self::Monochrome => Self::Custom,
+            Self::Custom => Self::Minimal,
         }
     }
 
@@ -423,6 +438,7 @@ impl ThemeMode {
             Self::Minimal => 0,
             Self::RetroTerminal => 1,
             Self::Monochrome => 2,
+            Self::Custom => 3,
         }
     }
 
@@ -430,6 +446,7 @@ impl ThemeMode {
         match index {
             0 => Self::Minimal,
             2 => Self::Monochrome,
+            3 => Self::Custom,
             _ => Self::RetroTerminal,
         }
     }
@@ -446,6 +463,7 @@ struct ThemePalette {
 }
 
 static ACTIVE_THEME: AtomicUsize = AtomicUsize::new(1);
+static CUSTOM_THEME: Mutex<Option<ThemePalette>> = Mutex::new(None);
 
 fn active_theme() -> ThemeMode {
     ThemeMode::from_index(ACTIVE_THEME.load(Ordering::Relaxed))
@@ -477,6 +495,18 @@ fn theme_palette(theme: ThemeMode) -> ThemePalette {
             panel_bg: Color::Rgb(24, 24, 24),
             muted_fg: Color::Rgb(130, 130, 130),
         },
+        ThemeMode::Custom => CUSTOM_THEME
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or(ThemePalette {
+                primary: Color::Rgb(121, 255, 102),
+                secondary: Color::Rgb(86, 211, 255),
+                accent: Color::Rgb(255, 203, 94),
+                deep_bg: Color::Rgb(8, 16, 9),
+                panel_bg: Color::Rgb(18, 32, 20),
+                muted_fg: Color::Rgb(145, 185, 135),
+            }),
     }
 }
 
@@ -548,6 +578,8 @@ struct App {
     search_query: String,
     search_hits: Vec<(usize, i64)>,
     search_state: TableState,
+    custom_theme_path: PathBuf,
+    custom_theme_mtime: Option<SystemTime>,
 }
 
 fn neon_blue() -> Color {
@@ -1217,6 +1249,111 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("cli-music-player")
         .join("config.json")
+}
+
+fn theme_file_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("cli-music-player")
+        .join("theme.json")
+}
+
+fn rgb_to_color(rgb: [u8; 3]) -> Color {
+    Color::Rgb(rgb[0], rgb[1], rgb[2])
+}
+
+fn palette_to_theme_file(palette: ThemePalette) -> ThemeFile {
+    fn unpack(color: Color) -> [u8; 3] {
+        match color {
+            Color::Rgb(r, g, b) => [r, g, b],
+            _ => [0, 0, 0],
+        }
+    }
+
+    ThemeFile {
+        primary: unpack(palette.primary),
+        secondary: unpack(palette.secondary),
+        accent: unpack(palette.accent),
+        deep_bg: unpack(palette.deep_bg),
+        panel_bg: unpack(palette.panel_bg),
+        muted_fg: unpack(palette.muted_fg),
+    }
+}
+
+fn ensure_theme_file(path: &Path) {
+    if path.exists() {
+        return;
+    }
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let template = palette_to_theme_file(theme_palette(ThemeMode::RetroTerminal));
+    if let Ok(json) = serde_json::to_string_pretty(&template) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn load_custom_theme(path: &Path) -> Result<(ThemePalette, Option<SystemTime>), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| format!("Failed to read theme json: {}", err))?;
+    let parsed: ThemeFile = serde_json::from_str(&content)
+        .map_err(|err| format!("Invalid theme json: {}", err))?;
+
+    let mtime = std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+
+    Ok((
+        ThemePalette {
+            primary: rgb_to_color(parsed.primary),
+            secondary: rgb_to_color(parsed.secondary),
+            accent: rgb_to_color(parsed.accent),
+            deep_bg: rgb_to_color(parsed.deep_bg),
+            panel_bg: rgb_to_color(parsed.panel_bg),
+            muted_fg: rgb_to_color(parsed.muted_fg),
+        },
+        mtime,
+    ))
+}
+
+fn apply_custom_theme_from_file(app: &mut App, notify: bool) {
+    match load_custom_theme(&app.custom_theme_path) {
+        Ok((palette, mtime)) => {
+            if let Ok(mut slot) = CUSTOM_THEME.lock() {
+                *slot = Some(palette);
+            }
+            app.custom_theme_mtime = mtime;
+
+            if notify {
+                app.status_message = Some(format!(
+                    "Custom theme reloaded from {}",
+                    app.custom_theme_path.display()
+                ));
+                app.status_until = Some(Instant::now() + Duration::from_secs(3));
+            }
+        }
+        Err(message) => {
+            app.status_message = Some(message);
+            app.status_until = Some(Instant::now() + Duration::from_secs(4));
+            app.custom_theme_mtime = std::fs::metadata(&app.custom_theme_path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok());
+        }
+    }
+}
+
+fn maybe_reload_custom_theme(app: &mut App) {
+    let changed = std::fs::metadata(&app.custom_theme_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|mtime| app.custom_theme_mtime.map(|known| known != mtime).unwrap_or(true))
+        .unwrap_or(false);
+
+    if changed {
+        apply_custom_theme_from_file(app, app.theme_mode == ThemeMode::Custom);
+    }
 }
 
 fn save_config(cfg: &Config) {
@@ -2255,6 +2392,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| PathBuf::from("."));
     let browser_entries = read_browser_entries(&browser_start);
     let visualizer = Arc::new(Mutex::new(VisualizerState::new(2048, 80)));
+    let custom_theme_path = theme_file_path();
+    ensure_theme_file(&custom_theme_path);
+    let (custom_theme_palette, custom_theme_mtime) = match load_custom_theme(&custom_theme_path) {
+        Ok((palette, mtime)) => (Some(palette), mtime),
+        Err(_) => (None, None),
+    };
+    if let Some(palette) = custom_theme_palette {
+        if let Ok(mut slot) = CUSTOM_THEME.lock() {
+            *slot = Some(palette);
+        }
+    }
 
     let mut app = App {
         songs,
@@ -2298,6 +2446,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         search_query: String::new(),
         search_hits: Vec::new(),
         search_state: TableState::default(),
+        custom_theme_path,
+        custom_theme_mtime,
     };
 
     if !app.songs.is_empty() {
@@ -2318,6 +2468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         pump_decode_ready(&mut app);
+        maybe_reload_custom_theme(&mut app);
 
         if app.current_track.is_some() && app.is_playing && sink.empty() {
             advance_to_next_track(&mut app, &sink);
@@ -2618,15 +2769,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('h') => {
                             app.theme_mode = app.theme_mode.next();
                             ACTIVE_THEME.store(app.theme_mode.as_index(), Ordering::Relaxed);
+                            if app.theme_mode == ThemeMode::Custom {
+                                apply_custom_theme_from_file(&mut app, true);
+                            }
                             save_config(&Config {
                                 music_folder: app.music_folder.clone(),
                                 theme: app.theme_mode.config_value().to_string(),
                             });
-                            app.status_message = Some(format!(
-                                "Theme switched to {}",
-                                app.theme_mode.label()
-                            ));
-                            app.status_until = Some(Instant::now() + Duration::from_secs(3));
+                            if app.theme_mode != ThemeMode::Custom {
+                                app.status_message = Some(format!(
+                                    "Theme switched to {}",
+                                    app.theme_mode.label()
+                                ));
+                                app.status_until = Some(Instant::now() + Duration::from_secs(3));
+                            }
                         }
                         KeyCode::Char('n') => {
                             if !app.songs.is_empty() {
