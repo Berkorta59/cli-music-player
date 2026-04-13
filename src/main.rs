@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
     mpsc,
+    Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +31,7 @@ use ratatui::{
     },
 };
 use rodio::{Decoder, OutputStream, Sink, Source};
+use rustfft::{FftPlanner, num_complex::Complex};
 use walkdir::WalkDir;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -52,6 +54,12 @@ struct Song {
     genre: String,
     duration: Option<Duration>,
     duration_label: String,
+}
+
+#[derive(Clone)]
+struct Playlist {
+    name: String,
+    paths: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -120,6 +128,178 @@ struct PendingDecode {
     rx: mpsc::Receiver<Option<(Arc<[f32]>, u16, u32)>>,
 }
 
+struct VisualizerState {
+    fft_size: usize,
+    bands: usize,
+    hop_interval: usize,
+    sample_counter: usize,
+    ring: Vec<f32>,
+    ring_cursor: usize,
+    filled: usize,
+    magnitudes: Vec<f32>,
+    fft: Arc<dyn rustfft::Fft<f32>>,
+}
+
+impl VisualizerState {
+    fn new(fft_size: usize, bands: usize) -> Self {
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        Self {
+            fft_size,
+            bands,
+            hop_interval: (fft_size / 6).max(1),
+            sample_counter: 0,
+            ring: vec![0.0; fft_size],
+            ring_cursor: 0,
+            filled: 0,
+            magnitudes: vec![0.0; bands],
+            fft,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ring.fill(0.0);
+        self.magnitudes.fill(0.0);
+        self.ring_cursor = 0;
+        self.filled = 0;
+        self.sample_counter = 0;
+    }
+
+    fn ingest_sample(&mut self, sample: f32) {
+        self.ring[self.ring_cursor] = sample;
+        self.ring_cursor = (self.ring_cursor + 1) % self.fft_size;
+        self.filled = (self.filled + 1).min(self.fft_size);
+        self.sample_counter += 1;
+
+        if self.filled >= self.fft_size / 2 && self.sample_counter >= self.hop_interval {
+            self.sample_counter = 0;
+            self.recompute_fft();
+        }
+    }
+
+    fn recompute_fft(&mut self) {
+        let mut buffer = Vec::with_capacity(self.fft_size);
+        let base = if self.filled < self.fft_size {
+            0
+        } else {
+            self.ring_cursor
+        };
+
+        for idx in 0..self.fft_size {
+            let sample = self.ring[(base + idx) % self.fft_size];
+            let window = 0.5
+                - 0.5
+                    * (2.0 * std::f32::consts::PI * idx as f32 / (self.fft_size as f32 - 1.0))
+                        .cos();
+            buffer.push(Complex {
+                re: sample * window,
+                im: 0.0,
+            });
+        }
+
+        self.fft.process(&mut buffer);
+
+        let nyquist_bins = self.fft_size / 2;
+        let usable_bins = nyquist_bins.saturating_sub(2).max(self.bands);
+        let bins_per_band = (usable_bins / self.bands).max(1);
+        let mut next = vec![0.0; self.bands];
+
+        for (band_idx, slot) in next.iter_mut().enumerate() {
+            let start = 1 + band_idx * bins_per_band;
+            let end = (start + bins_per_band).min(nyquist_bins);
+            let mut peak = 0.0;
+            for bin in start..end {
+                let mag = buffer[bin].norm();
+                if mag > peak {
+                    peak = mag;
+                }
+            }
+            let db_like = (peak + 1e-7).log10().max(-6.0);
+            *slot = ((db_like + 6.0) / 6.0).clamp(0.0, 1.0);
+        }
+
+        for (current, updated) in self.magnitudes.iter_mut().zip(next.into_iter()) {
+            *current = if updated > *current {
+                *current * 0.25 + updated * 0.75
+            } else {
+                *current * 0.86 + updated * 0.14
+            };
+        }
+    }
+
+    fn snapshot(&self, bins: usize) -> Vec<f32> {
+        if bins == 0 {
+            return Vec::new();
+        }
+        if bins == self.magnitudes.len() {
+            return self.magnitudes.clone();
+        }
+
+        let mut resized = vec![0.0; bins];
+        let src_len = self.magnitudes.len().max(1);
+        for (idx, slot) in resized.iter_mut().enumerate() {
+            let src = idx * src_len / bins;
+            *slot = self.magnitudes[src.min(src_len - 1)];
+        }
+        resized
+    }
+}
+
+struct TapSource<S>
+where
+    S: Source<Item = f32>,
+{
+    inner: S,
+    visualizer: Arc<Mutex<VisualizerState>>,
+}
+
+impl<S> Iterator for TapSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|sample| {
+            if let Ok(mut visualizer) = self.visualizer.lock() {
+                visualizer.ingest_sample(sample);
+            }
+            sample
+        })
+    }
+}
+
+impl<S> Source for TapSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+}
+
+fn tap_source<S>(source: S, visualizer: Arc<Mutex<VisualizerState>>) -> TapSource<S>
+where
+    S: Source<Item = f32>,
+{
+    TapSource {
+        inner: source,
+        visualizer,
+    }
+}
+
 impl Iterator for SeekableBufferSource {
     type Item = f32;
 
@@ -157,6 +337,7 @@ enum AppMode {
     Normal,
     FolderBrowser,
     PathInput,
+    PlaylistNameInput,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -346,7 +527,6 @@ struct App {
     album_art: Option<Vec<u8>>,
     album_art_cache: Option<AlbumArtCache>,
     active_tab: AppTab,
-    boot_time: Instant,
     music_folder: String,
     mode: AppMode,
     browser_path: PathBuf,
@@ -355,10 +535,15 @@ struct App {
     path_input: String,
     shuffle_enabled: bool,
     shuffle_history: Vec<usize>,
+    play_queue: Vec<usize>,
+    visualizer: Arc<Mutex<VisualizerState>>,
     repeat_mode: RepeatMode,
     theme_mode: ThemeMode,
     status_message: Option<String>,
     status_until: Option<Instant>,
+    playlists: Vec<Playlist>,
+    playlist_state: ListState,
+    playlist_name_input: String,
 }
 
 fn neon_blue() -> Color {
@@ -551,7 +736,7 @@ fn switch_to_seekable_cached_source(app: &mut App, sink: &Sink, target: Duration
     };
 
     sink.stop();
-    sink.append(source);
+    sink.append(tap_source(source, app.visualizer.clone()));
     sink.set_volume(app.volume);
 
     if was_paused {
@@ -580,13 +765,13 @@ fn seek_with_stream_decoder(app: &mut App, sink: &Sink, target: Duration) {
     };
     let reader = BufReader::new(file);
     let source = match Decoder::new(reader) {
-        Ok(source) => source.skip_duration(target),
+        Ok(source) => source.skip_duration(target).convert_samples::<f32>(),
         Err(_) => return,
     };
 
     let was_paused = sink.is_paused();
     sink.stop();
-    sink.append(source);
+    sink.append(tap_source(source, app.visualizer.clone()));
     sink.set_volume(app.volume);
 
     if was_paused {
@@ -622,7 +807,7 @@ fn play_selected_song(app: &mut App, sink: &Sink) {
     };
     let reader = BufReader::new(file);
     let source = match Decoder::new(reader) {
-        Ok(source) => source,
+        Ok(source) => source.convert_samples::<f32>(),
         Err(_) => {
             app.status_message = Some("Failed to decode selected track".to_string());
             app.status_until = Some(Instant::now() + Duration::from_secs(3));
@@ -632,7 +817,11 @@ fn play_selected_song(app: &mut App, sink: &Sink) {
         }
     };
 
-    sink.append(source);
+    if let Ok(mut visualizer) = app.visualizer.lock() {
+        visualizer.clear();
+    }
+
+    sink.append(tap_source(source, app.visualizer.clone()));
     sink.play();
     sink.set_volume(app.volume);
 
@@ -747,6 +936,41 @@ fn play_track_at(app: &mut App, sink: &Sink, track_idx: usize) {
     play_selected_song(app, sink);
 }
 
+fn pop_next_queued(app: &mut App) -> Option<usize> {
+    while !app.play_queue.is_empty() {
+        let idx = app.play_queue.remove(0);
+        if idx < app.songs.len() {
+            return Some(idx);
+        }
+    }
+
+    None
+}
+
+fn enqueue_selected_track(app: &mut App, play_next: bool) {
+    if app.songs.is_empty() {
+        app.status_message = Some("Queue is unavailable because no tracks are loaded".to_string());
+        app.status_until = Some(Instant::now() + Duration::from_secs(3));
+        return;
+    }
+
+    let idx = app.selected;
+    let title = app
+        .songs
+        .get(idx)
+        .map(|song| song.title.clone())
+        .unwrap_or_else(|| "Unknown Track".to_string());
+
+    if play_next {
+        app.play_queue.insert(0, idx);
+        app.status_message = Some(format!("Play next: {}", title));
+    } else {
+        app.play_queue.push(idx);
+        app.status_message = Some(format!("Queued: {}", title));
+    }
+    app.status_until = Some(Instant::now() + Duration::from_secs(3));
+}
+
 fn pick_shuffle_next(app: &App) -> Option<usize> {
     if app.songs.is_empty() {
         return None;
@@ -764,6 +988,11 @@ fn pick_shuffle_next(app: &App) -> Option<usize> {
 
 fn advance_to_next_track(app: &mut App, sink: &Sink) {
     if app.songs.is_empty() {
+        return;
+    }
+
+    if let Some(queued_idx) = pop_next_queued(app) {
+        play_track_at(app, sink, queued_idx);
         return;
     }
 
@@ -809,6 +1038,137 @@ fn format_duration(duration: Duration) -> String {
 fn get_album_art(path: &str) -> Option<Vec<u8>> {
     let tag = Tag::read_from_path(path).ok()?;
     tag.pictures().next().map(|picture| picture.data.clone())
+}
+
+fn playlists_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("cli-music-player")
+        .join("playlists")
+}
+
+fn parse_m3u(path: &Path) -> Option<Playlist> {
+    let name = path.file_stem()?.to_string_lossy().to_string();
+    let content = std::fs::read_to_string(path).ok()?;
+    let paths: Vec<String> = content
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .collect();
+    Some(Playlist { name, paths })
+}
+
+fn load_playlists() -> Vec<Playlist> {
+    let dir = playlists_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let mut playlists = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .map(|ext| ext.eq_ignore_ascii_case("m3u"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Some(pl) = parse_m3u(&path) {
+                playlists.push(pl);
+            }
+        }
+    }
+    playlists
+}
+
+fn playlist_safe_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn save_playlist_m3u(name: &str, paths: &[String]) -> std::io::Result<()> {
+    let dir = playlists_dir();
+    std::fs::create_dir_all(&dir)?;
+    let safe = playlist_safe_name(name);
+    let file_path = dir.join(format!("{}.m3u", safe));
+    let mut content = "#EXTM3U\n".to_string();
+    for path in paths {
+        content.push_str(path);
+        content.push('\n');
+    }
+    std::fs::write(&file_path, content)
+}
+
+fn delete_playlist_file(name: &str) -> bool {
+    let safe = playlist_safe_name(name);
+    let file_path = playlists_dir().join(format!("{}.m3u", safe));
+    std::fs::remove_file(file_path).is_ok()
+}
+
+fn save_current_queue_as_playlist(app: &mut App, name: &str) {
+    let mut paths: Vec<String> = Vec::new();
+    if let Some(idx) = app.current_track {
+        if let Some(song) = app.songs.get(idx) {
+            paths.push(song.path.clone());
+        }
+    }
+    for &idx in &app.play_queue {
+        if let Some(song) = app.songs.get(idx) {
+            paths.push(song.path.clone());
+        }
+    }
+    if paths.is_empty() {
+        app.status_message = Some("Queue is empty — nothing to save".to_string());
+        app.status_until = Some(Instant::now() + Duration::from_secs(3));
+        return;
+    }
+    match save_playlist_m3u(name, &paths) {
+        Ok(()) => {
+            app.playlists = load_playlists();
+            let saved_len = paths.len();
+            app.status_message = Some(format!("Saved '{}' ({} tracks)", name, saved_len));
+        }
+        Err(e) => {
+            app.status_message = Some(format!("Save failed: {}", e));
+        }
+    }
+    app.status_until = Some(Instant::now() + Duration::from_secs(3));
+}
+
+fn load_playlist_into_queue(app: &mut App, sink: &Sink, playlist_idx: usize, shuffle: bool) {
+    let Some(playlist) = app.playlists.get(playlist_idx) else {
+        return;
+    };
+    let mut indices: Vec<usize> = playlist
+        .paths
+        .iter()
+        .filter_map(|path| app.songs.iter().position(|song| song.path == *path))
+        .collect();
+    if shuffle {
+        indices.shuffle(&mut rand::thread_rng());
+    }
+    if indices.is_empty() {
+        app.status_message = Some("No matching tracks found in library".to_string());
+        app.status_until = Some(Instant::now() + Duration::from_secs(3));
+        return;
+    }
+    let count = indices.len();
+    let first = indices.remove(0);
+    app.play_queue.clear();
+    app.play_queue.extend(indices);
+    play_track_at(app, sink, first);
+    app.status_message = Some(format!("Loaded {} tracks from playlist", count));
+    app.status_until = Some(Instant::now() + Duration::from_secs(3));
 }
 
 fn render_album_art(data: &[u8], width: u16, height: u16) -> Text<'static> {
@@ -975,7 +1335,7 @@ fn panel_lines(app: &App) -> Vec<Line<'static>> {
                     ),
                     Span::raw("  "),
                     Span::styled(
-                        format!("{} tracks", app.songs.len()),
+                        format!("{} tracks | {} queued", app.songs.len(), app.play_queue.len()),
                         Style::default().fg(muted_fg()),
                     ),
                 ]),
@@ -986,7 +1346,7 @@ fn panel_lines(app: &App) -> Vec<Line<'static>> {
                     Style::default().fg(Color::White),
                 )]),
                 Line::from(vec![Span::styled(
-                    "Enter play, Space toggle, Left/Right seek, R shuffle, M repeat, H theme.",
+                    "Enter play, A queue, X play next, Space toggle, Left/Right seek, R shuffle.",
                     Style::default().fg(muted_fg()),
                 )]),
             ]
@@ -1064,21 +1424,25 @@ fn panel_lines(app: &App) -> Vec<Line<'static>> {
             })
             .collect(),
         AppTab::Playlists => vec![
+            Line::from(vec![
+                Span::styled(
+                    "Playlists",
+                    Style::default()
+                        .fg(neon_pink())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} saved  |  .m3u format", app.playlists.len()),
+                    Style::default().fg(muted_fg()),
+                ),
+            ]),
             Line::from(vec![Span::styled(
-                "Night Drive",
-                Style::default()
-                    .fg(neon_purple())
-                    .add_modifier(Modifier::BOLD),
+                "Enter: load  \u{2022}  S: shuffle-load  \u{2022}  s: save queue  \u{2022}  d: delete",
+                Style::default().fg(muted_fg()),
             )]),
-            Line::from("High-energy synth picks based on the current library."),
             Line::from(""),
-            Line::from(vec![Span::styled(
-                "Afterglow",
-                Style::default()
-                    .fg(neon_pink())
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from("A softer stack of melodic tracks and slower transitions."),
+            Line::from(""),
         ],
         AppTab::Search => vec![
             Line::from(vec![Span::styled(
@@ -1109,17 +1473,14 @@ fn visualizer_color(level: f64) -> Color {
     }
 }
 
-fn build_visualizer(width: u16, height: u16, phase: f64) -> Text<'static> {
+fn build_visualizer(width: u16, height: u16, bins: &[f32]) -> Text<'static> {
     let columns = usize::from((width / 2).max(1));
     let rows = usize::from(height.max(1));
 
-    let mut amplitudes = Vec::with_capacity(columns);
-    for idx in 0..columns {
-        let idxf = idx as f64;
-        let wave = ((phase * 2.7 + idxf * 0.44).sin() * 0.5 + 0.5) * 0.55
-            + ((phase * 4.1 + idxf * 0.21).cos() * 0.5 + 0.5) * 0.45;
-        let normalized = wave.clamp(0.08, 1.0);
-        amplitudes.push((normalized * rows as f64).round() as usize);
+    let mut amplitudes = vec![0usize; columns];
+    for (idx, amp) in amplitudes.iter_mut().enumerate() {
+        let value = bins.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        *amp = ((value * rows as f32).round() as usize).max(1);
     }
 
     let mut lines = Vec::with_capacity(rows);
@@ -1183,6 +1544,7 @@ fn render_now_playing_bar(f: &mut ratatui::Frame, area: Rect, app: &App) {
         "Shuffle Off"
     };
     let playback_modes = format!("{} | {}", shuffle_text, app.repeat_mode.label());
+    let queue_text = format!("Queue: {}", app.play_queue.len());
     let theme_text = format!("Theme: {}", app.theme_mode.label());
     let left_text = Paragraph::new(vec![Line::from(vec![Span::styled(
         state_text,
@@ -1191,6 +1553,9 @@ fn render_now_playing_bar(f: &mut ratatui::Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     )]), Line::from(vec![Span::styled(
         playback_modes,
+        Style::default().fg(neon_blue()),
+    )]), Line::from(vec![Span::styled(
+        queue_text,
         Style::default().fg(neon_blue()),
     )]), Line::from(vec![Span::styled(
         theme_text,
@@ -1342,6 +1707,49 @@ fn render_track_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .wrap(Wrap { trim: true });
     f.render_widget(info, chunks[0]);
 
+    if app.active_tab == AppTab::Playlists {
+        let items: Vec<ListItem> = if app.playlists.is_empty() {
+            vec![ListItem::new(Span::styled(
+                "No playlists saved yet. Press [s] to save the current queue.",
+                Style::default().fg(muted_fg()),
+            ))]
+        } else {
+            app.playlists
+                .iter()
+                .map(|pl| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            pl.name.clone(),
+                            Style::default()
+                                .fg(neon_purple())
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  {} tracks", pl.paths.len()),
+                            Style::default().fg(muted_fg()),
+                        ),
+                    ]))
+                })
+                .collect()
+        };
+        let playlist_list = List::new(items)
+            .block(primary_block(Line::from(vec![Span::styled(
+                " Saved Playlists ",
+                Style::default()
+                    .fg(neon_blue())
+                    .add_modifier(Modifier::BOLD),
+            )])))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(155, 122, 255))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▍ ");
+        f.render_stateful_widget(playlist_list, chunks[1], &mut app.playlist_state);
+        return;
+    }
+
     if app.active_tab != AppTab::Queue {
         let preview_rows: Vec<Row> = app
             .songs
@@ -1444,10 +1852,11 @@ fn render_track_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 }
 
 fn render_visualizer(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let phase = if app.is_playing {
-        current_elapsed(app).as_secs_f64()
+    let columns = usize::from((area.width / 2).max(1));
+    let bins = if let Ok(visualizer) = app.visualizer.lock() {
+        visualizer.snapshot(columns)
     } else {
-        app.boot_time.elapsed().as_secs_f64() * 0.6
+        vec![0.0; columns]
     };
 
     let block = secondary_block(Line::from(vec![
@@ -1457,12 +1866,12 @@ fn render_visualizer(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 .fg(neon_pink())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("soft neon equalizer", Style::default().fg(muted_fg())),
+        Span::styled("live FFT monitor", Style::default().fg(muted_fg())),
     ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let visualizer = Paragraph::new(build_visualizer(inner.width, inner.height, phase))
+    let visualizer = Paragraph::new(build_visualizer(inner.width, inner.height, &bins))
         .style(Style::default().bg(panel_bg()));
     f.render_widget(visualizer, inner);
 }
@@ -1527,6 +1936,10 @@ fn render_footer(
         Span::styled(" sections   ", Style::default().fg(muted_fg())),
         Span::styled("r", Style::default().fg(neon_blue())),
         Span::styled(" shuffle   ", Style::default().fg(muted_fg())),
+        Span::styled("a", Style::default().fg(neon_blue())),
+        Span::styled(" queue   ", Style::default().fg(muted_fg())),
+        Span::styled("x", Style::default().fg(neon_blue())),
+        Span::styled(" play next   ", Style::default().fg(muted_fg())),
         Span::styled("m", Style::default().fg(neon_blue())),
         Span::styled(" repeat   ", Style::default().fg(muted_fg())),
         Span::styled("h", Style::default().fg(neon_blue())),
@@ -1641,6 +2054,38 @@ fn render_browser_popup(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     f.render_widget(help, chunks[2]);
 }
 
+fn render_playlist_name_popup(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(52, 22, area);
+    f.render_widget(Clear, popup);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(neon_purple()))
+        .style(Style::default().bg(deep_bg()));
+    let inner = outer.inner(popup);
+    f.render_widget(outer, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(inner);
+
+    let input = Paragraph::new(format!("{}█", app.playlist_name_input))
+        .block(primary_block(Line::from(vec![Span::styled(
+            " Playlist Name ",
+            Style::default()
+                .fg(neon_blue())
+                .add_modifier(Modifier::BOLD),
+        )])))
+        .style(Style::default().fg(Color::White));
+    f.render_widget(input, chunks[0]);
+
+    let hint = Paragraph::new("Enter: save  •  Esc: cancel")
+        .style(Style::default().fg(muted_fg()))
+        .alignment(Alignment::Center);
+    f.render_widget(hint, chunks[1]);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config();
     let initial_theme = ThemeMode::from_config(&config.theme);
@@ -1676,6 +2121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from("."));
     let browser_entries = read_browser_entries(&browser_start);
+    let visualizer = Arc::new(Mutex::new(VisualizerState::new(2048, 80)));
 
     let mut app = App {
         songs,
@@ -1697,7 +2143,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         album_art: None,
         album_art_cache: None,
         active_tab: AppTab::Queue,
-        boot_time: Instant::now(),
         music_folder: initial_folder.clone(),
         mode: AppMode::Normal,
         browser_path: browser_start,
@@ -1706,12 +2151,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path_input: String::new(),
         shuffle_enabled: false,
         shuffle_history: Vec::new(),
+        play_queue: Vec::new(),
+        visualizer,
         repeat_mode: RepeatMode::Off,
         theme_mode: initial_theme,
         status_message: initial_status,
         status_until: Some(
             Instant::now() + Duration::from_secs(if songs_are_empty { 10 } else { 4 }),
         ),
+        playlists: load_playlists(),
+        playlist_state: ListState::default(),
+        playlist_name_input: String::new(),
     };
 
     if !app.songs.is_empty() {
@@ -1818,6 +2268,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if matches!(app.mode, AppMode::FolderBrowser | AppMode::PathInput) {
                 render_browser_popup(f, f.size(), &mut app);
             }
+            if app.mode == AppMode::PlaylistNameInput {
+                render_playlist_name_popup(f, f.size(), &app);
+            }
         })?;
 
         if event::poll(Duration::from_millis(120))? {
@@ -1844,12 +2297,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 app.selected += 1;
                                 app.table_state.select(Some(app.selected));
+                            } else if app.active_tab == AppTab::Playlists
+                                && !app.playlists.is_empty()
+                            {
+                                let next = (app.playlist_state.selected().unwrap_or(0) + 1)
+                                    .min(app.playlists.len() - 1);
+                                app.playlist_state.select(Some(next));
                             }
                         }
                         KeyCode::Up => {
                             if app.active_tab == AppTab::Queue && app.selected > 0 {
                                 app.selected -= 1;
                                 app.table_state.select(Some(app.selected));
+                            } else if app.active_tab == AppTab::Playlists {
+                                let cur = app.playlist_state.selected().unwrap_or(0);
+                                if cur > 0 {
+                                    app.playlist_state.select(Some(cur - 1));
+                                }
                             }
                         }
                         KeyCode::Left => {
@@ -1859,7 +2323,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             seek_relative(&mut app, &sink, 5);
                         }
                         KeyCode::Enter => {
-                            play_selected_song(&mut app, &sink);
+                            if app.active_tab == AppTab::Playlists {
+                                let idx = app.playlist_state.selected().unwrap_or(0);
+                                if !app.playlists.is_empty() {
+                                    load_playlist_into_queue(&mut app, &sink, idx, false);
+                                }
+                            } else {
+                                play_selected_song(&mut app, &sink);
+                            }
                         }
                         KeyCode::Char('r') => {
                             app.shuffle_enabled = !app.shuffle_enabled;
@@ -1872,6 +2343,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Shuffle mode disabled".to_string()
                             });
                             app.status_until = Some(Instant::now() + Duration::from_secs(3));
+                        }
+                        KeyCode::Char('a') => {
+                            enqueue_selected_track(&mut app, false);
+                        }
+                        KeyCode::Char('x') => {
+                            enqueue_selected_track(&mut app, true);
+                        }
+                        KeyCode::Char('s') => {
+                            if app.active_tab == AppTab::Playlists {
+                                if app.current_track.is_none() && app.play_queue.is_empty() {
+                                    app.status_message =
+                                        Some("Queue is empty — nothing to save".to_string());
+                                    app.status_until =
+                                        Some(Instant::now() + Duration::from_secs(3));
+                                } else {
+                                    app.playlist_name_input = String::new();
+                                    app.mode = AppMode::PlaylistNameInput;
+                                }
+                            }
+                        }
+                        KeyCode::Char('S') => {
+                            if app.active_tab == AppTab::Playlists {
+                                let idx = app.playlist_state.selected().unwrap_or(0);
+                                if !app.playlists.is_empty() {
+                                    load_playlist_into_queue(&mut app, &sink, idx, true);
+                                }
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            if app.active_tab == AppTab::Playlists {
+                                let idx = app.playlist_state.selected().unwrap_or(0);
+                                if let Some(pl) = app.playlists.get(idx) {
+                                    let name = pl.name.clone();
+                                    if delete_playlist_file(&name) {
+                                        app.playlists = load_playlists();
+                                        let new_len = app.playlists.len();
+                                        let new_sel = if new_len > 0 {
+                                            Some(idx.min(new_len - 1))
+                                        } else {
+                                            None
+                                        };
+                                        app.playlist_state.select(new_sel);
+                                        app.status_message =
+                                            Some(format!("Deleted playlist '{}'", name));
+                                    } else {
+                                        app.status_message =
+                                            Some(format!("Failed to delete '{}'", name));
+                                    }
+                                    app.status_until =
+                                        Some(Instant::now() + Duration::from_secs(3));
+                                }
+                            }
                         }
                         KeyCode::Char('m') => {
                             app.repeat_mode = app.repeat_mode.next();
@@ -2011,6 +2534,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.album_art = None;
                                 app.album_art_cache = None;
                                 app.shuffle_history.clear();
+                                app.play_queue.clear();
                                 refresh_library_metrics(&mut app);
                                 app.status_message =
                                     Some(format!("{} tracks loaded", app.songs.len()));
@@ -2087,6 +2611,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.album_art = None;
                                     app.album_art_cache = None;
                                     app.shuffle_history.clear();
+                                    app.play_queue.clear();
                                     refresh_library_metrics(&mut app);
                                     app.status_message =
                                         Some(format!("{} tracks loaded", app.songs.len()));
@@ -2095,6 +2620,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.mode = AppMode::Normal;
                                 }
                             }
+                        }
+                        _ => {}
+                    },
+                    AppMode::PlaylistNameInput => match key.code {
+                        KeyCode::Esc => {
+                            app.mode = AppMode::Normal;
+                        }
+                        KeyCode::Backspace => {
+                            app.playlist_name_input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.playlist_name_input.push(c);
+                        }
+                        KeyCode::Enter => {
+                            let name = app.playlist_name_input.trim().to_string();
+                            if name.is_empty() {
+                                app.status_message =
+                                    Some("Playlist name cannot be empty".to_string());
+                                app.status_until =
+                                    Some(Instant::now() + Duration::from_secs(3));
+                            } else {
+                                save_current_queue_as_playlist(&mut app, &name);
+                            }
+                            app.mode = AppMode::Normal;
                         }
                         _ => {}
                     },
