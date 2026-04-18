@@ -1,0 +1,1 @@
+A Terminal-based music player built with Rust — featuring a TUI interface (ratatui), fuzzy search, playlist management, album art rendering, audio spectrum visualizer (FFT), ID3 tag reading, shuffle, theming support, and audio playback via rodio.
